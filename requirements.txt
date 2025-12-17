@@ -1,0 +1,8 @@
+yfinance
+tqdm
+requests
+lxml
+pandas
+numpy
+flask
+functions-framework

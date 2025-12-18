@@ -83,13 +83,21 @@ def get_cached_results():
         cache_content = blob.download_as_string()
         data = json.loads(cache_content)
         
+        # Validar que tenga la estructura correcta
+        if "results" not in data or "cached_at" not in data:
+            log("⚠ Caché corrupto, regenerando datos...")
+            blob.delete()
+            return None
+        
         cache_time = datetime.fromisoformat(data.get("cached_at", ""))
         time_diff = datetime.now() - cache_time
         
         if time_diff < timedelta(hours=CACHE_TTL_HOURS):
             hours_ago = round(time_diff.total_seconds() / 3600, 1)
             log(f"✓ Usando datos del caché (generados hace {hours_ago} horas)")
-            return data
+            
+            # IMPORTANTE: Devolver solo los resultados, no toda la estructura
+            return data["results"]
         else:
             log(f"⚠ Caché expirado (más de {CACHE_TTL_HOURS}h), regenerando datos...")
             blob.delete()
@@ -97,6 +105,8 @@ def get_cached_results():
             
     except Exception as e:
         log(f"⚠ Error leyendo caché: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def save_to_cache(results):
@@ -522,8 +532,11 @@ def run_analysis():
     
     # Intentar obtener del caché primero
     cached_results = get_cached_results()
-    if cached_results:
-        return cached_results["results"]
+    if cached_results is not None:
+        # Agregar info de que vino del caché
+        if isinstance(cached_results, dict):
+            cached_results["from_cache"] = True
+        return cached_results
     
     # Si no hay caché válido, ejecutar análisis completo
     log("="*60)
@@ -618,8 +631,15 @@ def run_analysis():
     df = pd.DataFrame(rows)
 
     if df.empty:
-        error_result = {"error": "Sin resultados (posible rate-limit o filtros muy estrictos)"}
+        error_result = {
+            "error": "Sin resultados (posible rate-limit o filtros muy estrictos)",
+            "total_analyzed": 0,
+            "candidates_count": 0,
+            "from_cache": False,
+            "generated_at": datetime.now().isoformat()
+        }
         log("❌ Error: Sin resultados")
+        # NO guardar en caché si hay error
         return error_result
     
     # 6. Ordenar y filtrar candidatos
@@ -638,9 +658,9 @@ def run_analysis():
         "total_analyzed": len(df),
         "candidates_count": len(candidates),
         "top_10": candidates.head(10).to_dict('records'),
-        "top_20": candidates.head(20).to_dict('records'),
         "generated_at": datetime.now().isoformat(),
         "cache_enabled": GCS_AVAILABLE,
+        "from_cache": False,
         "execution_time_seconds": execution_time
     }
     

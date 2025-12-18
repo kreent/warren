@@ -1,29 +1,27 @@
-# Usar imagen oficial de Python
-FROM python:3.11-slim
+# Imagen base de Python ligera
+FROM python:3.10-slim
+
+# Evitar que Python genere archivos .pyc y permitir logs en tiempo real
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
 # Establecer directorio de trabajo
 WORKDIR /app
 
-# Copiar archivos de dependencias
-COPY requirements.txt .
+# Instalar dependencias del sistema necesarias para lxml y pandas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Instalar dependencias
+# Instalar dependencias de Python
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código de la aplicación
-COPY main_optimized.py main.py
+# Copiar el código fuente
+COPY main.py .
 
-# Configurar variables de entorno
-ENV PORT=8080
-ENV PYTHONUNBUFFERED=1
-
-# Exponer puerto
+# Exponer el puerto que usa Flask (8080 por defecto en Cloud Run)
 EXPOSE 8080
 
-# Usar Gunicorn como servidor de producción
-# Configuración optimizada:
-# - workers: 2 (ajustar según CPU disponible)
-# - threads: 4 (para I/O concurrente)
-# - timeout: 300 (5 minutos para el análisis inicial)
-# - worker-class: gthread (para aprovechar threading)
-CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 300 --worker-class gthread main:app
+# Comando para ejecutar la aplicación
+CMD ["python", "main.py"]

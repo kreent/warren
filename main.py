@@ -123,8 +123,14 @@ def save_to_cache(results):
         }
         
         blob = bucket.blob(CACHE_FILE_NAME)
+        
+        # Serializar JSON manejando NaN, Infinity, etc.
+        json_string = json.dumps(cache_data, default=str, allow_nan=False)
+        # Reemplazar cualquier NaN que quede
+        json_string = json_string.replace('NaN', 'null').replace('Infinity', 'null').replace('-Infinity', 'null')
+        
         blob.upload_from_string(
-            json.dumps(cache_data, default=str),
+            json_string,
             content_type='application/json'
         )
         
@@ -133,6 +139,8 @@ def save_to_cache(results):
         
     except Exception as e:
         log(f"⚠ Error guardando en caché: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # -------- Lectura de universo de tickers --------
@@ -654,10 +662,13 @@ def run_analysis():
     # 7. Preparar resultado
     execution_time = round(time.time() - start_time, 2)
     
+    # Reemplazar NaN con None para JSON válido
+    top_10_data = candidates.head(10).replace({np.nan: None}).to_dict('records')
+    
     result = {
         "total_analyzed": len(df),
         "candidates_count": len(candidates),
-        "top_10": candidates.head(10).to_dict('records'),
+        "top_10": top_10_data,
         "generated_at": datetime.now().isoformat(),
         "cache_enabled": GCS_AVAILABLE,
         "from_cache": False,
@@ -704,7 +715,14 @@ def analyze():
         log("="*60)
         
         results = run_analysis()
-        return jsonify(results)
+        
+        # Asegurar que el JSON sea válido (sin NaN, Infinity, etc.)
+        response = app.response_class(
+            response=json.dumps(results, default=str, allow_nan=False).replace('NaN', 'null').replace('Infinity', 'null').replace('-Infinity', 'null'),
+            status=200,
+            mimetype='application/json'
+        )
+        return response
         
     except Exception as e:
         log(f"❌ Error en análisis: {str(e)}")

@@ -1,5 +1,5 @@
 # =========================================
-# Screener Value + Momentum + Buffett (Cloud Run) - OPTIMIZADO
+# Screener Value + Momentum + Buffett (Cloud Run) - OPTIMIZADO v2.1
 # =========================================
 
 import pandas as pd
@@ -12,46 +12,53 @@ import time
 import logging
 from functools import lru_cache
 from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Silencio de logs ruidosos
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # -------- Parámetros generales --------
-UNIVERSE_LIMIT   = 250     # universo base (S&P500 ∪ Nasdaq-100)
-BATCH_SIZE       = 60      # descarga por lotes para históricos (40–60 va bien)
-MAX_FUND_REQS    = 160     # máximo de tickers a pedir fundamentals
+UNIVERSE_LIMIT   = 200     # Reducido para ser más rápido
+BATCH_SIZE       = 60
+MAX_FUND_REQS    = 120     # Reducido para evitar rate limits
 
 PRICE_MIN, PRICE_MAX = 2.0, 2000.0
 
-# Filtros "value+momentum" base (clásico)
-SCORE_MIN        = 5
-PE_MAX           = 15.0
-PB_MAX           = 1.5
-ROE_MIN          = 0.12
-DEBT_EBITDA_MAX  = 3.0
+# Filtros más flexibles para obtener resultados
+SCORE_MIN        = 4       # Reducido de 5 a 4
+PE_MAX           = 25.0    # Aumentado de 15 a 25
+PB_MAX           = 3.0     # Aumentado de 1.5 a 3
+ROE_MIN          = 0.08    # Reducido de 0.12 a 0.08
+DEBT_EBITDA_MAX  = 5.0     # Aumentado de 3.0 a 5.0
 
 # Técnicos base
-RSI_MIN, RSI_MAX = 30, 60
+RSI_MIN, RSI_MAX = 25, 70  # Rango más amplio
 VOL_LOOKBACK     = 20
 MA_SHORT, MA_LONG= 50, 200
 
 # Buffett / DCF
-DISCOUNT_RATE    = 0.10    # 10% tasa de descuento
-TERMINAL_G       = 0.02    # 2% crecimiento a perpetuidad
-MAX_GROWTH_CAP   = 0.12    # 12% cap de crecimiento a 10 años
-MOS_THRESHOLD    = 0.30    # margen de seguridad del 30%
-FCF_SALES_PROXY  = 0.05    # proxy de FCF si falta: 5% de ventas
+DISCOUNT_RATE    = 0.10
+TERMINAL_G       = 0.02
+MAX_GROWTH_CAP   = 0.12
+MOS_THRESHOLD    = 0.30
+FCF_SALES_PROXY  = 0.05
 
 # -------- CONFIGURACIÓN DE CACHÉ --------
-CACHE_TTL_SECONDS = 3600  # 1 hora - ajustar según necesidad
+CACHE_TTL_SECONDS = 3600  # 1 hora
 cached_analysis_result = None
 cached_analysis_timestamp = None
 
 def log(msg): 
-    print(msg)
+    logger.info(msg)
     sys.stdout.flush()
 
 # -------- Lectura robusta de listas (S&P500 ∪ Nasdaq-100) con CACHÉ --------
@@ -73,17 +80,20 @@ def clean_symbols(series):
     s = s[~s.str.contains(r"[^\w\-]", regex=True)]
     return s
 
-# CACHÉ para universe S&P500 (se actualiza raramente)
 @lru_cache(maxsize=1)
 def universe_sp500_cached():
-    """Caché del listado S&P500 - se mantiene en memoria por vida de la instancia"""
+    """Caché del listado S&P500"""
     try:
         for tb in try_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"):
             cols = [str(c) for c in tb.columns]; lowers = [c.lower() for c in cols]
             if any(c in ("symbol","ticker") for c in lowers):
                 idx = next(i for i,c in enumerate(lowers) if c in ("symbol","ticker"))
+                log(f"✓ Obtenidos {len(tb)} tickers del S&P500")
                 return clean_symbols(tb.iloc[:, idx])
-    except Exception: pass
+    except Exception as e:
+        log(f"⚠ Error obteniendo S&P500 desde Wikipedia: {e}")
+    
+    # Fallback a GitHub
     for gh in [
         "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
         "https://raw.githubusercontent.com/plotly/dash-stock-tickers/master/symbols.csv"
@@ -91,23 +101,27 @@ def universe_sp500_cached():
         g = try_read_csv(gh)
         if g is not None:
             for c in ["Symbol","symbol","Ticker","ticker","code"]:
-                if c in g.columns: return clean_symbols(g[c])
-    try:
-        if hasattr(yf, "tickers_sp500"):
-            return pd.Series([t.replace(".","-").upper() for t in yf.tickers_sp500()])
-    except Exception: pass
+                if c in g.columns:
+                    log(f"✓ Obtenidos {len(g)} tickers del S&P500 (GitHub)")
+                    return clean_symbols(g[c])
+    
+    log("⚠ No se pudo obtener S&P500 desde fuentes externas")
     return pd.Series([], dtype=str)
 
-# CACHÉ para universe Nasdaq-100
 @lru_cache(maxsize=1)
 def universe_nasdaq100_cached():
-    """Caché del listado Nasdaq-100 - se mantiene en memoria por vida de la instancia"""
+    """Caché del listado Nasdaq-100"""
     try:
         for tb in try_read_html("https://en.wikipedia.org/wiki/Nasdaq-100"):
             cols = [str(c) for c in tb.columns]; lowers = [c.lower() for c in cols]
             cand_idx = [i for i,c in enumerate(lowers) if ("ticker" in c) or ("symbol" in c)]
-            if cand_idx: return clean_symbols(tb.iloc[:, cand_idx[0]])
-    except Exception: pass
+            if cand_idx:
+                log(f"✓ Obtenidos {len(tb)} tickers del Nasdaq-100")
+                return clean_symbols(tb.iloc[:, cand_idx[0]])
+    except Exception as e:
+        log(f"⚠ Error obteniendo Nasdaq-100 desde Wikipedia: {e}")
+    
+    # Fallback a GitHub
     for gh in [
         "https://raw.githubusercontent.com/nikbearbrown/Financial-Machine-Learning/master/data/nasdaq100list.csv",
         "https://raw.githubusercontent.com/sstrickx/yahoofinance-api/master/src/test/resources/nasdaq100.csv"
@@ -115,7 +129,11 @@ def universe_nasdaq100_cached():
         g = try_read_csv(gh)
         if g is not None:
             for c in ["Symbol","symbol","Ticker","ticker"]:
-                if c in g.columns: return clean_symbols(g[c])
+                if c in g.columns:
+                    log(f"✓ Obtenidos {len(g)} tickers del Nasdaq-100 (GitHub)")
+                    return clean_symbols(g[c])
+    
+    log("⚠ No se pudo obtener Nasdaq-100 desde fuentes externas")
     return pd.Series([], dtype=str)
 
 def fetch_universe(limit=UNIVERSE_LIMIT):
@@ -123,7 +141,9 @@ def fetch_universe(limit=UNIVERSE_LIMIT):
     sp = universe_sp500_cached()
     ndx = universe_nasdaq100_cached()
     base = pd.Series(pd.concat([sp, ndx]).dropna().unique())
-    if base.empty:
+    
+    if base.empty or len(base) < 50:
+        log("⚠ Usando universo de respaldo (hardcoded)")
         base = pd.Series([
             "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","BAC","WFC","C","GS","MS",
             "V","MA","PYPL","NFLX","PEP","KO","MCD","WMT","T","VZ","XOM","CVX","COP",
@@ -131,9 +151,13 @@ def fetch_universe(limit=UNIVERSE_LIMIT):
             "ORCL","IBM","INTC","AMD","QCOM","AVGO","TXN","ADI","MU","CRM","NOW",
             "DIS","CMCSA","TGT","HD","LOW","NKE","COST","BKNG","ABNB","MAR","SBUX",
             "CAT","DE","BA","GE","HON","UPS","FDX","NOC","LMT","RTX","GD",
-            "ADBE","PANW","FTNT","SNOW","ZS","OKTA","DDOG","NET","SQ","COIN","ROKU"
+            "ADBE","PANW","FTNT","SNOW","ZS","OKTA","DDOG","NET","SQ","COIN","ROKU",
+            "SHOP","UBER","LYFT","DASH","SPOT","ZM","DOCU","TWLO","PLTR","U",
+            "F","GM","RIVN","LCID","NIO","XPEV","LI","BYDDY","TM","HMC"
         ])
+    
     base = base.drop_duplicates().sample(min(limit, len(base)), random_state=42).reset_index(drop=True)
+    log(f"✓ Universo final: {len(base)} tickers")
     return base.to_list()
 
 # -------- Técnicos (SMA/RSI/MACD/OBV/ATR) --------
@@ -169,33 +193,37 @@ def atr(high, low, close, length=14):
     return tr.rolling(length, min_periods=length).mean()
 
 def compute_technicals(df):
-    close = df["Close"].copy(); vol = df["Volume"].copy()
-    high  = df["High"].copy();  low = df["Low"].copy()
+    try:
+        close = df["Close"].copy(); vol = df["Volume"].copy()
+        high  = df["High"].copy();  low = df["Low"].copy()
 
-    df["SMA50"]  = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
-    df["SMA200"] = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
-    df["RSI14"]  = rsi(close, 14)
-    m, s, h      = macd(close, 12, 26, 9)
-    df["MACD"], df["MACDsig"], df["MACDh"] = m, s, h
-    df["VolAvg20"] = vol.rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK).mean()
-    df["OBV"] = obv(close, vol)
-    df["ATR14"] = atr(high, low, close, 14)
+        df["SMA50"]  = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
+        df["SMA200"] = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
+        df["RSI14"]  = rsi(close, 14)
+        m, s, h      = macd(close, 12, 26, 9)
+        df["MACD"], df["MACDsig"], df["MACDh"] = m, s, h
+        df["VolAvg20"] = vol.rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK).mean()
+        df["OBV"] = obv(close, vol)
+        df["ATR14"] = atr(high, low, close, 14)
 
-    valid = df.dropna()
-    if valid.empty:
+        valid = df.dropna()
+        if valid.empty:
+            return None, None
+        last = valid.iloc[-1]
+        conds = {
+            "trend_up":  bool(last["Close"] > last["SMA200"] and last["SMA50"] > last["SMA200"]),
+            "rsi_ok":    bool(RSI_MIN <= last["RSI14"] <= RSI_MAX),
+            "macd_up":   bool(last["MACD"] > last["MACDsig"] and last["MACDh"] > 0),
+            "volume_up": bool(last["Volume"] > last["VolAvg20"] and (last["Close"] > df["Close"].iloc[-2] if len(df)>1 else True)),
+            "obv_up":    bool(valid["OBV"].iloc[-1] > valid["OBV"].iloc[-5] if len(valid) > 5 else False),
+            "atr_pct":   float(last["ATR14"]/last["Close"]) if last["Close"] else np.nan,
+        }
+        return conds, last
+    except Exception as e:
+        log(f"⚠ Error en compute_technicals: {e}")
         return None, None
-    last = valid.iloc[-1]
-    conds = {
-        "trend_up":  bool(last["Close"] > last["SMA200"] and last["SMA50"] > last["SMA200"]),
-        "rsi_ok":    bool(RSI_MIN <= last["RSI14"] <= RSI_MAX),
-        "macd_up":   bool(last["MACD"] > last["MACDsig"] and last["MACDh"] > 0),
-        "volume_up": bool(last["Volume"] > last["VolAvg20"] and (last["Close"] > df["Close"].iloc[-2] if len(df)>1 else True)),
-        "obv_up":    bool(valid["OBV"].iloc[-1] > valid["OBV"].iloc[-5] if len(valid) > 5 else False),
-        "atr_pct":   float(last["ATR14"]/last["Close"]) if last["Close"] else np.nan,
-    }
-    return conds, last
 
-# -------- Descarga de históricos por lotes (adaptativo) con paralelización --------
+# -------- Descarga de históricos por lotes con paralelización --------
 def _required_period_for(ma_long=MA_LONG, extra_days=40):
     days = ma_long + extra_days
     if days <= 250:   return "1y"
@@ -211,50 +239,47 @@ def _download_single_ticker(tk, period):
             return tk, None
         df = df[["Open","High","Low","Close","Volume"]].copy()
         df = df.dropna()
+        if len(df) < MA_LONG:
+            return tk, None
         return tk, df
-    except Exception:
+    except Exception as e:
         return tk, None
 
-def download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=0, retries=1, max_workers=10):
-    """
-    Descarga históricos usando ThreadPoolExecutor para paralelizar
-    """
+def download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=0, retries=1, max_workers=8):
+    """Descarga históricos usando ThreadPoolExecutor"""
     if period is None:
         period = _required_period_for(MA_LONG, 40)
     
-    log(f"Descargando históricos para {len(tickers)} tickers (period={period}) en paralelo...")
+    log(f"📊 Descargando históricos para {len(tickers)} tickers (period={period})...")
     
     results = {}
+    failed = 0
     
-    # Usar ThreadPoolExecutor para descargas paralelas
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Enviar todas las tareas
         future_to_ticker = {
             executor.submit(_download_single_ticker, tk, period): tk 
             for tk in tickers
         }
         
-        # Recoger resultados a medida que se completan
         for future in as_completed(future_to_ticker):
             tk, df = future.result()
             if df is not None and not df.empty:
                 results[tk] = df
+            else:
+                failed += 1
     
-    log(f"✓ Descargados {len(results)}/{len(tickers)} tickers con datos válidos")
+    log(f"✓ Descargados: {len(results)} exitosos, {failed} fallidos")
     return results
 
-# -------- Fundamentales y DCF con CACHÉ por ticker --------
-# Caché de 1 hora para fundamentales de cada ticker
+# -------- Fundamentales y DCF con CACHÉ --------
 @lru_cache(maxsize=500)
 def get_fundamentals_and_quality_cached(ticker):
-    """Versión cacheada de get_fundamentals_and_quality"""
-    return _get_fundamentals_and_quality_impl(ticker)
-
-def _get_fundamentals_and_quality_impl(ticker):
+    """Versión cacheada de fundamentales"""
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
-    except Exception:
+    except Exception as e:
+        log(f"⚠ Error obteniendo info de {ticker}: {e}")
         info = {}
 
     pe = info.get("trailingPE") or info.get("forwardPE")
@@ -331,7 +356,6 @@ def _get_fundamentals_and_quality_impl(ticker):
         try: shares = int(float(mktcap)/float(price))
         except Exception: pass
 
-    # DCF con proxy prudente si falta FCF
     intrinsic = None
     try:
         fcf_base = fcf if fcf not in (None, np.nan) else (FCF_SALES_PROXY * float(revenue) if revenue not in (None,0) else None)
@@ -347,7 +371,8 @@ def _get_fundamentals_and_quality_impl(ticker):
             ev = np.nansum(fcfs) + terminal/((1+DISCOUNT_RATE)**1)
             equity_val = ev - (net_debt if net_debt is not None else 0.0)
             intrinsic = float(equity_val) / float(shares)
-    except Exception: pass
+    except Exception:
+        pass
 
     return {
         "pe": (float(pe) if pe not in (None, "None", np.nan) else None),
@@ -365,11 +390,10 @@ def _get_fundamentals_and_quality_impl(ticker):
         "intrinsic":    (float(intrinsic) if intrinsic not in (None, np.nan) else None)
     }
 
-# Wrapper para mantener compatibilidad
 def get_fundamentals_and_quality(ticker):
     return get_fundamentals_and_quality_cached(ticker)
 
-# -------- Scoring: clásico + Buffett Score --------
+# -------- Scoring --------
 def evaluate_conditions(fund, tech):
     fundamentals = {
         "val_pe_pb": (fund.get("pe") is not None and fund["pe"] <= PE_MAX) and \
@@ -391,20 +415,14 @@ def evaluate_conditions(fund, tech):
     return six, fundamentals, tech, score, bonus
 
 def buffett_score(fund, price, tech):
-    """
-    0–10 pts: Calidad (4), Fortaleza (2), Valoración (3), Técnica (1)
-    """
     pts = 0.0
-    # Calidad
     if fund.get("roic") is not None and fund["roic"] >= 0.12: pts += 1.5
     if fund.get("op_margin") is not None and fund["op_margin"] >= 0.15: pts += 1.0
     if fund.get("gross_margin") is not None and fund["gross_margin"] >= 0.40: pts += 0.5
     growth = np.nanmean([x for x in [fund.get("rev_cagr"), fund.get("ni_cagr")] if x is not None])
     if pd.notna(growth) and growth >= 0.05: pts += 1.0
-    # Fortaleza
     if fund.get("debt_ebitda") is not None and fund["debt_ebitda"] <= 2.5: pts += 1.0
     if fund.get("fcf") is not None and fund["fcf"] > 0: pts += 1.0
-    # Valoración
     intrinsic = fund.get("intrinsic")
     if intrinsic not in (None, np.nan) and price is not None:
         mos_ok = price <= intrinsic * (1 - MOS_THRESHOLD)
@@ -412,105 +430,158 @@ def buffett_score(fund, price, tech):
         elif price <= intrinsic * 0.9: pts += 1.0
     if fund.get("pe") is not None and fund["pe"] <= 20: pts += 0.5
     if fund.get("pb") is not None and fund["pb"] <= 3: pts += 0.5
-    # Técnica
     if tech["trend_up"] and (tech["rsi_ok"] or tech["macd_up"]) and tech.get("obv_up", False): pts += 1.0
     return round(min(10.0, pts), 2)
 
-# -------------- ANÁLISIS CON CACHÉ --------------
+# -------------- ANÁLISIS CON MEJOR LOGGING --------------
 def run_analysis():
-    """
-    Ejecuta el análisis completo. Esta función es llamada cuando el caché expira.
-    """
+    """Ejecuta el análisis completo con filtros flexibles"""
+    log("=" * 60)
+    log("INICIANDO ANÁLISIS")
+    log("=" * 60)
+    
     tickers = fetch_universe(limit=UNIVERSE_LIMIT)
-    log(f"Tickers a evaluar: {len(tickers)}")
+    log(f"📋 Tickers a evaluar: {len(tickers)}")
 
-    # 1) Históricos por lotes (adaptativo y paralelizado)
-    hist_map = download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=0, retries=1, max_workers=10)
+    # 1) Históricos
+    hist_map = download_history_batch(tickers, period=None, max_workers=8)
+    
+    if not hist_map:
+        log("❌ ERROR: No se pudieron descargar históricos")
+        return {
+            "error": "No se pudieron descargar datos de mercado",
+            "details": "Verifica tu conexión o los límites de Yahoo Finance"
+        }
 
-    # 2) Prefiltro técnico + rango precio
+    log(f"✓ Históricos descargados: {len(hist_map)} tickers")
+
+    # 2) Prefiltro técnico MUY flexible
     tech_ok = []
     for tk, hist in hist_map.items():
-        price = float(hist["Close"].iloc[-1])
-        if not (PRICE_MIN <= price <= PRICE_MAX): continue
-        # asegurar que hay data suficiente para SMA200
-        if hist.shape[0] < MA_LONG + 5: continue
-        tech, _ = compute_technicals(hist)
-        # Prefiltro "clásico": tendencia + (RSI y MACD)
-        if tech and tech["trend_up"] and (tech["rsi_ok"] and tech["macd_up"]):
-            tech_ok.append((tk, price, tech))
+        try:
+            price = float(hist["Close"].iloc[-1])
+            if not (PRICE_MIN <= price <= PRICE_MAX): 
+                continue
+            if hist.shape[0] < MA_LONG + 5: 
+                continue
+            
+            tech, _ = compute_technicals(hist)
+            if tech is None:
+                continue
+            
+            # Filtro SUPER flexible: solo necesita estar por encima de SMA200 O tener RSI ok O MACD ok
+            if tech["trend_up"] or tech["rsi_ok"] or tech["macd_up"]:
+                tech_ok.append((tk, price, tech))
+        except Exception as e:
+            log(f"⚠ Error procesando {tk}: {e}")
+            continue
 
-    # Prefiltro "suave" si quedaron pocos
-    TARGET_MIN = 120
-    if len(tech_ok) < TARGET_MIN:
+    log(f"✓ Pasaron filtro técnico: {len(tech_ok)} tickers")
+
+    # Si aún son muy pocos, relajar más
+    if len(tech_ok) < 30:
+        log("⚠ Muy pocos resultados, aplicando filtro ultra-flexible...")
         tech_ok = []
         for tk, hist in hist_map.items():
-            price = float(hist["Close"].iloc[-1])
-            if not (PRICE_MIN <= price <= PRICE_MAX) or hist.shape[0] < MA_LONG + 5: continue
-            tech, _ = compute_technicals(hist)
-            if tech and (hist["Close"].iloc[-1] > hist["Close"].rolling(MA_LONG).mean().iloc[-1]) and (tech["rsi_ok"] or tech["macd_up"]):
-                tech_ok.append((tk, price, tech))
+            try:
+                price = float(hist["Close"].iloc[-1])
+                if not (PRICE_MIN <= price <= PRICE_MAX) or hist.shape[0] < 100:
+                    continue
+                tech, _ = compute_technicals(hist)
+                if tech:
+                    tech_ok.append((tk, price, tech))
+            except:
+                continue
 
     tech_ok = tech_ok[:MAX_FUND_REQS]
+    log(f"📊 Analizando fundamentales de {len(tech_ok)} tickers...")
 
-    # 3) Fundamentales + DCF + Scorings
-    log(f"Obteniendo fundamentales para {len(tech_ok)} tickers...")
+    # 3) Fundamentales
     rows = []
-    for tk, price, tech in tech_ok:
-        fund = get_fundamentals_and_quality(tk)
-        six, fund_d, tech_d, score, bonus = evaluate_conditions(fund, tech)
-        bscore = buffett_score(fund, price, tech)
-        intrinsic = fund.get("intrinsic")
-        mos = None
-        if intrinsic not in (None, np.nan):
-            try: mos = (intrinsic - price)/intrinsic
-            except Exception: mos = None
-        rows.append({
-            "ticker": tk, "price": round(price,2),
-            "score6": score, "buffett_score": bscore,
-            "pe": fund.get("pe"), "pb": fund.get("pb"), "roe": fund.get("roe"),
-            "roic": fund.get("roic"), "gross_margin": fund.get("gross_margin"),
-            "op_margin": fund.get("op_margin"), "net_margin": fund.get("net_margin"),
-            "rev_cagr": fund.get("rev_cagr"), "ni_cagr": fund.get("ni_cagr"),
-            "debt_ebitda": fund.get("debt_ebitda"), "fcf_positive": fund.get("fcf_positive"),
-            "intrinsic": intrinsic, "mos": mos,
-            "trend_up": tech["trend_up"], "rsi_ok": tech["rsi_ok"], "macd_up": tech["macd_up"],
-            "obv_up": tech.get("obv_up", False), "atr_pct": tech.get("atr_pct", np.nan),
-            "volume_up": tech["volume_up"]
-        })
+    for i, (tk, price, tech) in enumerate(tech_ok):
+        if i % 20 == 0:
+            log(f"  Procesando... {i}/{len(tech_ok)}")
+        
+        try:
+            fund = get_fundamentals_and_quality(tk)
+            six, fund_d, tech_d, score, bonus = evaluate_conditions(fund, tech)
+            bscore = buffett_score(fund, price, tech)
+            intrinsic = fund.get("intrinsic")
+            mos = None
+            if intrinsic not in (None, np.nan):
+                try: 
+                    mos = (intrinsic - price)/intrinsic
+                except: 
+                    mos = None
+            
+            rows.append({
+                "ticker": tk, "price": round(price,2),
+                "score6": score, "buffett_score": bscore,
+                "pe": fund.get("pe"), "pb": fund.get("pb"), "roe": fund.get("roe"),
+                "roic": fund.get("roic"), "gross_margin": fund.get("gross_margin"),
+                "op_margin": fund.get("op_margin"), "net_margin": fund.get("net_margin"),
+                "rev_cagr": fund.get("rev_cagr"), "ni_cagr": fund.get("ni_cagr"),
+                "debt_ebitda": fund.get("debt_ebitda"), "fcf_positive": fund.get("fcf_positive"),
+                "intrinsic": intrinsic, "mos": mos,
+                "trend_up": tech["trend_up"], "rsi_ok": tech["rsi_ok"], "macd_up": tech["macd_up"],
+                "obv_up": tech.get("obv_up", False), "atr_pct": tech.get("atr_pct", np.nan),
+                "volume_up": tech["volume_up"]
+            })
+        except Exception as e:
+            log(f"⚠ Error en fundamentales de {tk}: {e}")
+            continue
 
     df = pd.DataFrame(rows)
+    log(f"✓ DataFrame creado con {len(df)} registros")
 
     if df.empty:
-        return {"error": "Sin resultados (posible rate-limit o filtros muy estrictos)"}
+        log("❌ DataFrame vacío después de análisis")
+        return {
+            "error": "Sin resultados después del análisis",
+            "details": "Posibles causas: rate-limit de Yahoo Finance, problemas de red, o filtros muy estrictos",
+            "suggestions": [
+                "Espera 15 minutos y vuelve a intentar",
+                "Verifica que el servicio tiene acceso a internet",
+                "Revisa los logs para más detalles"
+            ]
+        }
     
-    # Orden: primero Buffett score, luego score6, luego ROIC
+    # Orden
     df = df.sort_values(["buffett_score","score6","roic"], ascending=[False,False,False]).reset_index(drop=True)
 
-    # Mostrar candidatas: Buffett≥7 o score6≥SCORE_MIN
-    candidates = df[(df["buffett_score"] >= 7) | (df["score6"] >= SCORE_MIN)].copy()
+    # Candidatas con filtros MUY flexibles
+    candidates = df[(df["buffett_score"] >= 5) | (df["score6"] >= 3)].copy()
     if candidates.empty:
-        candidates = df[(df["buffett_score"] >= 6) | (df["score6"] >= 4)].copy()
+        log("⚠ No hay candidatos con score alto, mostrando todos los resultados")
+        candidates = df.head(20)  # Al menos mostrar top 20
 
-    # Convertir a formato JSON-serializable
+    log(f"✓ Análisis completado: {len(candidates)} candidatos encontrados")
+    log("=" * 60)
+
     result = {
         "total_analyzed": len(df),
         "candidates_count": len(candidates),
-        "top_10": candidates.head(10).to_dict('records'),
+        "top_20": candidates.head(20).to_dict('records'),
+        "all_results_count": len(df),
         "cached_at": datetime.now().isoformat(),
-        "cache_ttl_seconds": CACHE_TTL_SECONDS
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "filters_applied": {
+            "price_range": f"${PRICE_MIN}-${PRICE_MAX}",
+            "score_min": SCORE_MIN,
+            "pe_max": PE_MAX,
+            "pb_max": PB_MAX,
+            "roe_min": ROE_MIN
+        }
     }
     
     return result
 
 def get_cached_analysis():
-    """
-    Retorna el análisis cacheado si está vigente, o ejecuta uno nuevo
-    """
+    """Retorna análisis cacheado o ejecuta uno nuevo"""
     global cached_analysis_result, cached_analysis_timestamp
     
     current_time = datetime.now()
     
-    # Verificar si el caché es válido
     if cached_analysis_result is not None and cached_analysis_timestamp is not None:
         time_elapsed = (current_time - cached_analysis_timestamp).total_seconds()
         if time_elapsed < CACHE_TTL_SECONDS:
@@ -520,7 +591,6 @@ def get_cached_analysis():
             result["cache_age_seconds"] = int(time_elapsed)
             return result
     
-    # Caché expirado o no existe - ejecutar análisis
     log("Ejecutando nuevo análisis (caché expirado o no existe)...")
     cached_analysis_result = run_analysis()
     cached_analysis_timestamp = current_time
@@ -530,54 +600,79 @@ def get_cached_analysis():
     result["cache_age_seconds"] = 0
     return result
 
-# Flask app para Cloud Run
+# Flask app
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return jsonify({
-        "status": "Warren Screener API - OPTIMIZADO",
-        "version": "2.0",
+        "status": "Warren Screener API - OPTIMIZADO v2.1",
+        "version": "2.1",
+        "improvements": [
+            "Filtros más flexibles para obtener más resultados",
+            "Mejor logging y diagnóstico de errores",
+            "Manejo robusto de rate-limits",
+            "Universo de respaldo hardcoded"
+        ],
         "endpoints": {
             "/analyze": "Análisis principal (con caché de 1 hora)",
             "/analyze?force_refresh=1": "Forzar nuevo análisis",
-            "/health": "Health check"
-        },
-        "optimizations": [
-            "Caché en memoria de resultados (1 hora TTL)",
-            "Caché de listados S&P500 y Nasdaq-100",
-            "Caché de fundamentales por ticker",
-            "Descarga paralela de históricos",
-            "Servidor Gunicorn recomendado"
-        ]
+            "/health": "Health check",
+            "/debug": "Información de debug"
+        }
     })
 
 @app.route('/health')
 def health():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "cache_active": cached_analysis_result is not None
+    })
+
+@app.route('/debug')
+def debug():
+    """Endpoint de debug para diagnóstico"""
+    cache_age = None
+    if cached_analysis_timestamp:
+        cache_age = int((datetime.now() - cached_analysis_timestamp).total_seconds())
+    
+    return jsonify({
+        "cache_exists": cached_analysis_result is not None,
+        "cache_age_seconds": cache_age,
+        "cache_ttl": CACHE_TTL_SECONDS,
+        "universe_limit": UNIVERSE_LIMIT,
+        "filters": {
+            "score_min": SCORE_MIN,
+            "pe_max": PE_MAX,
+            "pb_max": PB_MAX,
+            "roe_min": ROE_MIN,
+            "debt_ebitda_max": DEBT_EBITDA_MAX
+        }
+    })
 
 @app.route('/analyze')
 def analyze():
     try:
-        # Permitir forzar refresh con parámetro
-        from flask import request
         force_refresh = request.args.get('force_refresh', '0') == '1'
         
         if force_refresh:
             global cached_analysis_result, cached_analysis_timestamp
             cached_analysis_result = None
             cached_analysis_timestamp = None
-            log("Forzando refresh del caché...")
+            log("🔄 Forzando refresh del caché...")
         
         results = get_cached_analysis()
         return jsonify(results)
     except Exception as e:
-        log(f"ERROR: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        log(f"❌ ERROR en /analyze: {str(e)}")
+        import traceback
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8080))
-    # NOTA: Para producción, usar Gunicorn en lugar de app.run()
     app.run(host="0.0.0.0", port=port, threaded=True)

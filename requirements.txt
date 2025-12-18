@@ -6,3 +6,4 @@ pandas
 numpy
 flask
 functions-framework
+google-cloud-storage

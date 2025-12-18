@@ -2,8 +2,8 @@
 FROM python:3.10-slim
 
 # Evitar que Python genere archivos .pyc y permitir logs en tiempo real
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # Establecer directorio de trabajo
 WORKDIR /app

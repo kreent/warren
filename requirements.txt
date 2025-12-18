@@ -7,3 +7,5 @@ numpy
 flask
 functions-framework
 google-cloud-storage
+gunicorn==21.2.0
+

@@ -1,5 +1,6 @@
 # =========================================
 # Screener Value + Momentum + Buffett (Cloud Run)
+# VERSIÓN COMPLETA - RESULTADOS IDÉNTICOS AL ORIGINAL
 # CON CACHÉ EN CLOUD STORAGE DE 24 HORAS
 # =========================================
 
@@ -38,7 +39,7 @@ except Exception as e:
     GCS_AVAILABLE = False
     bucket = None
 
-# -------- Parámetros generales --------
+# -------- Parámetros generales (IDÉNTICOS AL ORIGINAL) --------
 UNIVERSE_LIMIT   = 250
 BATCH_SIZE       = 60
 MAX_FUND_REQS    = 160
@@ -79,11 +80,9 @@ def get_cached_results():
             log("⚠ No hay datos en caché, ejecutando análisis completo")
             return None
         
-        # Descargar y parsear datos
         cache_content = blob.download_as_string()
         data = json.loads(cache_content)
         
-        # Validar que tenga la estructura correcta
         if "results" not in data or "cached_at" not in data:
             log("⚠ Caché corrupto, regenerando datos...")
             blob.delete()
@@ -95,8 +94,6 @@ def get_cached_results():
         if time_diff < timedelta(hours=CACHE_TTL_HOURS):
             hours_ago = round(time_diff.total_seconds() / 3600, 1)
             log(f"✓ Usando datos del caché (generados hace {hours_ago} horas)")
-            
-            # IMPORTANTE: Devolver solo los resultados, no toda la estructura
             return data["results"]
         else:
             log(f"⚠ Caché expirado (más de {CACHE_TTL_HOURS}h), regenerando datos...")
@@ -123,17 +120,10 @@ def save_to_cache(results):
         }
         
         blob = bucket.blob(CACHE_FILE_NAME)
-        
-        # Serializar JSON manejando NaN, Infinity, etc.
         json_string = json.dumps(cache_data, default=str, allow_nan=False)
-        # Reemplazar cualquier NaN que quede
         json_string = json_string.replace('NaN', 'null').replace('Infinity', 'null').replace('-Infinity', 'null')
         
-        blob.upload_from_string(
-            json_string,
-            content_type='application/json'
-        )
-        
+        blob.upload_from_string(json_string, content_type='application/json')
         log(f"✓ Resultados guardados en caché por {CACHE_TTL_HOURS} horas")
         return True
         
@@ -143,7 +133,7 @@ def save_to_cache(results):
         traceback.print_exc()
         return False
 
-# -------- Lectura de universo de tickers --------
+# -------- Lectura robusta de universo (ORIGINAL COMPLETO) --------
 def try_read_html(url):
     r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
     r.raise_for_status()
@@ -181,6 +171,12 @@ def universe_sp500():
             for c in ["Symbol","symbol","Ticker","ticker","code"]:
                 if c in g.columns: 
                     return clean_symbols(g[c])
+    
+    try:
+        if hasattr(yf, "tickers_sp500"):
+            return pd.Series([t.replace(".","-").upper() for t in yf.tickers_sp500()])
+    except Exception: 
+        pass
     
     return pd.Series([], dtype=str)
 
@@ -226,7 +222,7 @@ def fetch_universe(limit=UNIVERSE_LIMIT):
     base = base.drop_duplicates().sample(min(limit, len(base)), random_state=42).reset_index(drop=True)
     return base.to_list()
 
-# -------- Indicadores técnicos --------
+# -------- Indicadores técnicos (ORIGINAL COMPLETO) --------
 def ema(s, span): 
     return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
@@ -292,7 +288,7 @@ def compute_technicals(df):
     }
     return conds, last
 
-# -------- Descarga de históricos --------
+# -------- Descarga de históricos (ORIGINAL COMPLETO) --------
 def _required_period_for(ma_long=MA_LONG, extra_days=40):
     days = ma_long + extra_days
     if days <= 250: return "1y"
@@ -301,179 +297,341 @@ def _required_period_for(ma_long=MA_LONG, extra_days=40):
     else: return "5y"
 
 def download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=2.0, retries=2):
-    if period is None:
-        period = _required_period_for(MA_LONG, 40)
+    if period is None: 
+        period = _required_period_for()
     
-    log(f"📥 Descargando históricos: {len(tickers)} símbolos (lotes={batch_size}, period={period})…")
-    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
-    hist_map = {}
-
-    for batch_idx, batch in enumerate(tqdm(batches, desc="Lotes")):
-        syms_str = " ".join(batch)
-        attempt = 0
+    candidates_periods = [period, "2y", "3y", "5y"]
+    histories = {}
+    n = len(tickers)
+    
+    log(f"📥 Descargando históricos: {n} símbolos (batch={batch_size}, period={period})…")
+    
+    for i in range(0, n, batch_size):
+        batch = tickers[i:i+batch_size]
+        data = None
         
-        while attempt < retries:
-            try:
-                data = yf.download(syms_str, period=period, group_by="ticker", progress=False, threads=True)
-                
-                if isinstance(data.columns, pd.MultiIndex):
-                    for sym in batch:
-                        try:
-                            df = data[sym].dropna(how="all")
-                            if df.empty or df.shape[0] < MA_LONG + 5: 
-                                continue
-                            hist_map[sym] = df
-                        except Exception: 
-                            pass
-                else:
-                    if len(batch) == 1 and not data.empty:
-                        hist_map[batch[0]] = data
+        for per in candidates_periods:
+            for att in range(retries+1):
+                try:
+                    # CRÍTICO: threads=False y auto_adjust=False como el original
+                    data = yf.download(
+                        tickers=batch, 
+                        period=per, 
+                        interval="1d",
+                        auto_adjust=False,  # IMPORTANTE
+                        group_by="ticker", 
+                        threads=False,  # IMPORTANTE
+                        progress=False
+                    )
+                    if data is not None and not data.empty: 
+                        break
+                except Exception:
+                    data = None
+                time.sleep(sleep*(att+1))
+            if data is not None and not data.empty: 
                 break
-                
-            except Exception:
-                attempt += 1
-                if attempt < retries: 
-                    time.sleep(sleep)
         
-        if batch_idx < len(batches)-1: 
-            time.sleep(sleep)
+        if data is None or data.empty: 
+            continue
+
+        if isinstance(data.columns, pd.MultiIndex):
+            for tk in batch:
+                if tk in data.columns.get_level_values(0):
+                    sub = data[tk].copy()
+                    sub.columns = [c.title() for c in sub.columns]
+                    if {"Close","Volume","High","Low"}.issubset(sub.columns) and not sub.dropna().empty:
+                        histories[tk] = sub
+        else:
+            sub = data.copy()
+            sub.columns = [c[0].title() if isinstance(c, tuple) else str(c).title() for c in sub.columns]
+            if {"Close","Volume","High","Low"}.issubset(sub.columns) and not sub.dropna().empty:
+                histories[batch[0]] = sub
+        
+        time.sleep(sleep)
     
-    log(f"✓ Históricos descargados: {len(hist_map)}/{len(tickers)}")
-    return hist_map
+    log(f"✓ Históricos descargados: {len(histories)}/{n}")
+    return histories
 
-# -------- Análisis fundamental --------
-def get_fundamentals_and_quality(ticker):
+# -------- Funciones auxiliares fundamentales (ORIGINAL COMPLETO) --------
+def safe_get(d, keys, default=None):
+    """Extrae valor de dict/Series con múltiples claves posibles"""
+    for k in keys:
+        if isinstance(d, dict) and k in d and pd.notna(d[k]): 
+            return d[k]
+        if isinstance(d, pd.Series) and k in d.index and pd.notna(d.loc[k]): 
+            return d.loc[k]
+    return default
+
+def last_col(df):
+    """Obtiene la última columna de un DataFrame como Series"""
+    if not (isinstance(df, pd.DataFrame) and not df.empty):
+        return pd.Series(dtype=float)
+    col = df.columns[0]
+    s = df[col]
+    s.index = s.index.astype(str)
+    return s
+
+def get_statement(t, name, quarterly=False):
+    """Obtiene statement financiero (quarterly o annual)"""
+    df = getattr(t, f"{'quarterly_' if quarterly else ''}{name}", None)
+    return df if isinstance(df, pd.DataFrame) and not df.empty else None
+
+def series_ttm_from_quarterly(df_q, label):
+    """Calcula TTM (Trailing Twelve Months) desde data quarterly"""
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        
-        pe = info.get("forwardPE") or info.get("trailingPE")
-        pb = info.get("priceToBook")
-        roe = info.get("returnOnEquity")
-        debt_ebitda = info.get("debtToEbitda") or info.get("debtToEquity")
-        
-        gross_margin = info.get("grossMargins")
-        op_margin = info.get("operatingMargins")
-        net_margin = info.get("profitMargins")
-        roic = info.get("returnOnCapital") or info.get("returnOnAssets")
-        
-        mktcap = info.get("marketCap")
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        
-        cashflow = t.cashflow if hasattr(t, "cashflow") else None
-        income_stmt = t.financials if hasattr(t, "financials") else None
-        balance = t.balance_sheet if hasattr(t, "balance_sheet") else None
-        
-        rev_cagr, ni_cagr = None, None
-        if income_stmt is not None and not income_stmt.empty:
-            try:
-                rev_row = income_stmt.loc["Total Revenue"] if "Total Revenue" in income_stmt.index else None
-                ni_row = income_stmt.loc["Net Income"] if "Net Income" in income_stmt.index else None
-                
-                if rev_row is not None and len(rev_row) >= 2:
-                    r0, rN = rev_row.iloc[0], rev_row.iloc[-1]
-                    if pd.notna(r0) and pd.notna(rN) and rN != 0:
-                        rev_cagr = ((float(r0)/float(rN))**(1/(len(rev_row)-1))) - 1
-                
-                if ni_row is not None and len(ni_row) >= 2:
-                    n0, nN = ni_row.iloc[0], ni_row.iloc[-1]
-                    if pd.notna(n0) and pd.notna(nN) and nN > 0:
-                        ni_cagr = ((float(n0)/float(nN))**(1/(len(ni_row)-1))) - 1
-            except Exception: 
-                pass
-        
-        ocf, capex, shares, revenue, net_debt = None, None, None, None, None
-        
-        if cashflow is not None and not cashflow.empty:
-            try:
-                ocf_row = cashflow.loc["Operating Cash Flow"] if "Operating Cash Flow" in cashflow.index else None
-                if ocf_row is not None: 
-                    ocf = ocf_row.iloc[0]
-                
-                capex_row = cashflow.loc["Capital Expenditure"] if "Capital Expenditure" in cashflow.index else None
-                if capex_row is not None: 
-                    capex = abs(capex_row.iloc[0])
-            except Exception: 
-                pass
-        
-        if balance is not None and not balance.empty:
-            try:
-                shares_row = balance.loc["Ordinary Shares Number"] if "Ordinary Shares Number" in balance.index else None
-                if shares_row is None and "Share Issued" in balance.index:
-                    shares_row = balance.loc["Share Issued"]
-                if shares_row is not None: 
-                    shares = shares_row.iloc[0]
-                
-                cash_row = balance.loc["Cash And Cash Equivalents"] if "Cash And Cash Equivalents" in balance.index else None
-                debt_row = balance.loc["Total Debt"] if "Total Debt" in balance.index else None
-                if cash_row is not None and debt_row is not None:
-                    net_debt = float(debt_row.iloc[0]) - float(cash_row.iloc[0])
-            except Exception: 
-                pass
-        
-        if income_stmt is not None and not income_stmt.empty:
-            try:
-                rev_row = income_stmt.loc["Total Revenue"] if "Total Revenue" in income_stmt.index else None
-                if rev_row is not None: 
-                    revenue = rev_row.iloc[0]
-            except Exception: 
-                pass
-        
-        fcf = None
-        try:
-            if ocf is not None and capex is not None: 
-                fcf = float(ocf) - float(capex)
-        except Exception: 
-            pass
-        
-        if shares in (None, 0) and mktcap and price:
-            try: 
-                shares = int(float(mktcap)/float(price))
-            except Exception: 
-                pass
-        
-        # DCF
-        intrinsic = None
-        try:
-            fcf_base = fcf if fcf not in (None, np.nan) else (FCF_SALES_PROXY * float(revenue) if revenue not in (None,0) else None)
-            if fcf_base is not None and shares not in (None, 0):
-                g_base = np.nanmean([x for x in [rev_cagr, ni_cagr] if x is not None]) if any([rev_cagr, ni_cagr]) else 0.05
-                g_base = max(-0.05, min(float(g_base), MAX_GROWTH_CAP))
-                
-                fcfs, f = [], fcf_base
-                for y in range(1, 11):
-                    growth = g_base * (0.9 ** (y-1))
-                    f = f * (1 + growth)
-                    fcfs.append(f / ((1+DISCOUNT_RATE)**y))
-                
-                terminal = fcfs[-1] * (1+TERMINAL_G) / (DISCOUNT_RATE - TERMINAL_G)
-                ev = np.nansum(fcfs) + terminal/((1+DISCOUNT_RATE)**1)
-                equity_val = ev - (net_debt if net_debt is not None else 0.0)
-                intrinsic = float(equity_val) / float(shares)
-        except Exception: 
-            pass
-        
-        return {
-            "pe": (float(pe) if pe not in (None, "None", np.nan) else None),
-            "pb": (float(pb) if pb not in (None, "None", np.nan) else None),
-            "roe": (float(roe) if roe is not None else None),
-            "debt_ebitda": (float(debt_ebitda) if debt_ebitda not in (None, "None", np.nan) else None),
-            "fcf": fcf, 
-            "fcf_positive": (fcf is not None and fcf > 0),
-            "gross_margin": (float(gross_margin) if gross_margin is not None else None),
-            "op_margin": (float(op_margin) if op_margin is not None else None),
-            "net_margin": (float(net_margin) if net_margin is not None else None),
-            "rev_cagr": (float(rev_cagr) if rev_cagr is not None else None),
-            "ni_cagr": (float(ni_cagr) if ni_cagr is not None else None),
-            "roic": (float(roic) if roic is not None else None),
-            "shares_out": (int(shares) if shares not in (None, np.nan) else None),
-            "intrinsic": (float(intrinsic) if intrinsic not in (None, np.nan) else None)
-        }
+        s = df_q.loc[label].dropna()
+        if len(s) < 4: 
+            return None
+        return float(s.iloc[:4].sum())
     except Exception:
-        return {}
+        return None
 
-# -------- Scoring --------
+def pick_series_annual_or_ttm(t):
+    """
+    Obtiene métricas financieras: primero intenta annual, 
+    si falla calcula TTM desde quarterly
+    """
+    income_y = get_statement(t, "income_stmt", quarterly=False)
+    cash_y   = get_statement(t, "cashflow",    quarterly=False)
+    income_q = get_statement(t, "income_stmt", quarterly=True)
+    cash_q   = get_statement(t, "cashflow",    quarterly=True)
+
+    def from_annual(df, name):
+        return safe_get(last_col(df), [name]) if df is not None else None
+
+    revenue = from_annual(income_y, "Total Revenue")
+    netinc  = from_annual(income_y, "Net Income")
+    ebitda  = from_annual(income_y, "EBITDA")
+    ocf     = from_annual(cash_y,   "Total Cash From Operating Activities")
+    capex   = from_annual(cash_y,   "Capital Expenditures")
+
+    # Fallback a TTM si falta data anual
+    if revenue is None and income_q is not None:
+        revenue = series_ttm_from_quarterly(income_q, "Total Revenue")
+    if netinc is None and income_q is not None:
+        netinc = series_ttm_from_quarterly(income_q, "Net Income")
+    if ebitda is None and income_q is not None:
+        ebitda = series_ttm_from_quarterly(income_q, "EBITDA")
+    if ocf is None and cash_q is not None:
+        ocf = series_ttm_from_quarterly(cash_q, "Total Cash From Operating Activities")
+    if capex is None and cash_q is not None:
+        capex = series_ttm_from_quarterly(cash_q, "Capital Expenditures")
+
+    return revenue, netinc, ebitda, ocf, capex
+
+def compute_cagr(latest, past, periods):
+    """Calcula CAGR (Compound Annual Growth Rate)"""
+    try:
+        if latest is None or past in (None, 0) or periods <= 0: 
+            return None
+        ratio = float(latest)/float(past)
+        if ratio <= 0: 
+            return None
+        return ratio**(1/periods) - 1
+    except Exception:
+        return None
+
+def cagr_from_series(df, row_label, years_pref=5):
+    """Calcula CAGR desde una serie temporal con fallback a 3 o 2 años"""
+    if not (isinstance(df, pd.DataFrame) and not df.empty): 
+        return None
+    try:
+        s = df.loc[row_label].dropna()
+    except Exception:
+        return None
+    
+    # Intenta 5 años, luego 3, luego 2
+    if len(s) >= years_pref:
+        past, latest, periods = s.iloc[-years_pref], s.iloc[-1], years_pref-1
+    elif len(s) >= 3:
+        past, latest, periods = s.iloc[-3], s.iloc[-1], 2
+    elif len(s) >= 2:
+        past, latest, periods = s.iloc[-2], s.iloc[-1], 1
+    else:
+        return None
+    
+    return compute_cagr(latest, past, periods)
+
+# -------- Análisis fundamental COMPLETO (ORIGINAL) --------
+def get_fundamentals_and_quality(ticker):
+    """
+    Obtiene fundamentales con la LÓGICA COMPLETA del script original:
+    - Extracción robusta con safe_get
+    - Cálculo de TTM
+    - CAGR con fallbacks
+    - DCF con proxy de FCF
+    """
+    t = yf.Ticker(ticker)
+    finfo = getattr(t, "fast_info", {}) or {}
+    info  = getattr(t, "info", {}) or {}
+
+    # PE y PB con múltiples fuentes
+    pe = safe_get(finfo, ["trailingPe","trailingPE","pe_ratio"]) or \
+         safe_get(info, ["trailingPE","forwardPE","priceEpsTrailing12Months"])
+    pb = safe_get(finfo, ["priceToBook","price_to_book"]) or \
+         safe_get(info, ["priceToBook"])
+
+    shares = safe_get(finfo, ["sharesOutstanding","shares_outstanding"]) or \
+             safe_get(info, ["sharesOutstanding"])
+    mktcap = safe_get(info, ["marketCap"])
+    price  = safe_get(finfo, ["last_price","lastPrice"]) or \
+             safe_get(info, ["currentPrice"])
+
+    # Statements anuales
+    income_y = get_statement(t, "income_stmt", quarterly=False)
+    bal_y    = get_statement(t, "balance_sheet", quarterly=False)
+    cash_y   = get_statement(t, "cashflow", quarterly=False)
+
+    # Métricas con fallback a TTM
+    revenue, net_income, ebitda, ocf, capex = pick_series_annual_or_ttm(t)
+
+    inc_last = last_col(income_y)
+    bal_last = last_col(bal_y)
+    cf_last  = last_col(cash_y)
+
+    # Márgenes
+    gp = safe_get(inc_last, ["Gross Profit","GrossProfit"])
+    op_income = safe_get(inc_last, ["Operating Income","OperatingIncome","Operating Income Or Loss"])
+
+    gross_margin = (float(gp)/float(revenue)) if (gp is not None and revenue not in (None,0)) else None
+    op_margin    = (float(op_income)/float(revenue)) if (op_income is not None and revenue not in (None,0)) else None
+    net_margin   = (float(net_income)/float(revenue)) if (net_income is not None and revenue not in (None,0)) else None
+
+    # CAGR con fallbacks (5→3→2 años)
+    rev_cagr = cagr_from_series(income_y, "Total Revenue")
+    ni_cagr  = cagr_from_series(income_y, "Net Income")
+
+    # ROE
+    equity = safe_get(bal_last, [
+        "Total Stockholder Equity",
+        "Stockholders Equity",
+        "TotalEquity",
+        "Total Shareholder Equity",
+        "Total stockholders' equity"
+    ])
+    roe = None
+    try:
+        if net_income is not None and equity not in (None, 0): 
+            roe = float(net_income)/float(equity)
+    except Exception: 
+        pass
+
+    # Deuda
+    total_debt = safe_get(bal_last, ["Total Debt","TotalDebt","Short Long Term Debt","ShortLongTermDebt"])
+    if total_debt is None and isinstance(bal_last, pd.Series):
+        lt = safe_get(bal_last, ["Long Term Debt","LongTermDebt"]) or 0
+        st = safe_get(bal_last, ["Short Term Debt","ShortTermDebt","Current Portion Of Long Term Debt"]) or 0
+        total_debt = lt + st if (lt or st) else None
+    
+    cash = safe_get(bal_last, ["Cash","Cash And Cash Equivalents","CashAndCashEquivalents"])
+    net_debt = None
+    try:
+        if total_debt is not None and cash is not None:
+            net_debt = float(total_debt) - float(cash)
+    except Exception: 
+        pass
+
+    # ROIC
+    ebit  = safe_get(inc_last, ["Ebit","EBIT","Operating Income","OperatingIncome"])
+    tax_exp = safe_get(inc_last, ["Income Tax Expense","IncomeTaxExpense"])
+    pretax  = safe_get(inc_last, ["Income Before Tax","IncomeBeforeTax","Ebt","EBT"])
+    
+    tax_rate = None
+    try:
+        if tax_exp is not None and pretax not in (None,0):
+            tr = float(tax_exp)/abs(float(pretax))
+            tax_rate = min(max(tr, 0.0), 0.35)
+    except Exception: 
+        pass
+    if tax_rate is None: 
+        tax_rate = 0.21
+
+    invested_capital = None
+    try:
+        if equity is not None and total_debt is not None and cash is not None:
+            invested_capital = float(equity) + float(total_debt) - float(cash)
+    except Exception: 
+        pass
+
+    roic = None
+    try:
+        if ebit is not None and invested_capital not in (None, 0):
+            nopat = float(ebit) * (1 - tax_rate)
+            roic = nopat / float(invested_capital)
+    except Exception: 
+        pass
+
+    # Debt/EBITDA
+    debt_ebitda = None
+    try:
+        if ebitda not in (None, 0) and total_debt is not None:
+            debt_ebitda = float(total_debt) / float(ebitda)
+    except Exception: 
+        pass
+
+    # FCF
+    if ocf is None: 
+        ocf = safe_get(cf_last, ["Total Cash From Operating Activities","Operating Cash Flow","OperatingCashFlow"])
+    if capex is None: 
+        capex = safe_get(cf_last, ["Capital Expenditures","CapitalExpenditures","Purchase Of Property Plant And Equipment"])
+    
+    fcf = None
+    try:
+        if ocf is not None and capex is not None: 
+            fcf = float(ocf) - float(capex)
+    except Exception: 
+        pass
+
+    # Shares fallback
+    if shares in (None, 0) and mktcap and price:
+        try: 
+            shares = int(float(mktcap)/float(price))
+        except Exception: 
+            pass
+
+    # DCF con proxy prudente
+    intrinsic = None
+    try:
+        fcf_base = fcf if fcf not in (None, np.nan) else \
+                   (FCF_SALES_PROXY * float(revenue) if revenue not in (None,0) else None)
+        
+        if fcf_base is not None and shares not in (None, 0):
+            g_base = np.nanmean([x for x in [rev_cagr, ni_cagr] if x is not None]) if any([rev_cagr, ni_cagr]) else 0.05
+            g_base = max(-0.05, min(float(g_base), MAX_GROWTH_CAP))
+            
+            fcfs, f = [], fcf_base
+            for y in range(1, 11):
+                growth = g_base * (0.9 ** (y-1))
+                f = f * (1 + growth)
+                fcfs.append(f / ((1+DISCOUNT_RATE)**y))
+            
+            terminal = fcfs[-1] * (1+TERMINAL_G) / (DISCOUNT_RATE - TERMINAL_G)
+            ev = np.nansum(fcfs) + terminal/((1+DISCOUNT_RATE)**1)
+            equity_val = ev - (net_debt if net_debt is not None else 0.0)
+            intrinsic = float(equity_val) / float(shares)
+    except Exception: 
+        pass
+
+    return {
+        "pe": (float(pe) if pe not in (None, "None", np.nan) else None),
+        "pb": (float(pb) if pb not in (None, "None", np.nan) else None),
+        "roe": (float(roe) if roe is not None else None),
+        "debt_ebitda": (float(debt_ebitda) if debt_ebitda not in (None, "None", np.nan) else None),
+        "fcf": fcf, 
+        "fcf_positive": (fcf is not None and fcf > 0),
+        "gross_margin": (float(gross_margin) if gross_margin is not None else None),
+        "op_margin": (float(op_margin) if op_margin is not None else None),
+        "net_margin": (float(net_margin) if net_margin is not None else None),
+        "rev_cagr": (float(rev_cagr) if rev_cagr is not None else None),
+        "ni_cagr": (float(ni_cagr) if ni_cagr is not None else None),
+        "roic": (float(roic) if roic is not None else None),
+        "shares_out": (int(shares) if shares not in (None, np.nan) else None),
+        "intrinsic": (float(intrinsic) if intrinsic not in (None, np.nan) else None)
+    }
+
+# -------- Scoring (ORIGINAL COMPLETO) --------
 def evaluate_conditions(fund, tech):
+    """Evalúa condiciones fundamentales y técnicas"""
     fundamentals = {
         "val_pe_pb": (fund.get("pe") is not None and fund["pe"] <= PE_MAX) and \
                      (fund.get("pb") is not None and fund["pb"] <= PB_MAX),
@@ -494,6 +652,13 @@ def evaluate_conditions(fund, tech):
     return six, fundamentals, tech, score, bonus
 
 def buffett_score(fund, price, tech):
+    """
+    Buffett Score 0-10:
+    - Calidad (4): ROIC, márgenes, crecimiento
+    - Fortaleza (2): deuda, FCF
+    - Valoración (3): DCF MOS, PE, PB
+    - Técnica (1): tendencia + señales
+    """
     pts = 0.0
     
     # Calidad (4 pts)
@@ -534,33 +699,31 @@ def buffett_score(fund, price, tech):
     
     return round(min(10.0, pts), 2)
 
-# -------- Análisis principal --------
+# -------- PIPELINE PRINCIPAL (IDÉNTICO AL ORIGINAL) --------
 def run_analysis():
     """Ejecuta el análisis completo del screener"""
     
     # Intentar obtener del caché primero
     cached_results = get_cached_results()
     if cached_results is not None:
-        # Agregar info de que vino del caché
         if isinstance(cached_results, dict):
             cached_results["from_cache"] = True
         return cached_results
     
-    # Si no hay caché válido, ejecutar análisis completo
     log("="*60)
-    log("⏳ Iniciando análisis completo (sin caché válido)...")
+    log("⏳ Iniciando análisis completo...")
     log("="*60)
     start_time = time.time()
     
-    # 1. Obtener universo de tickers
+    # 1. Universo
     tickers = fetch_universe(limit=UNIVERSE_LIMIT)
     log(f"📋 Tickers a evaluar: {len(tickers)}")
 
-    # 2. Descargar históricos
+    # 2. Históricos
     hist_map = download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=2.0, retries=2)
 
-    # 3. Filtro técnico estricto
-    log("🔍 Aplicando filtros técnicos...")
+    # 3. Prefiltro técnico estricto
+    log("🔍 Aplicando prefiltro técnico estricto...")
     tech_ok = []
     for tk, hist in hist_map.items():
         price = float(hist["Close"].iloc[-1])
@@ -573,10 +736,10 @@ def run_analysis():
         if tech and tech["trend_up"] and (tech["rsi_ok"] and tech["macd_up"]):
             tech_ok.append((tk, price, tech))
 
-    # 4. Filtro técnico suave si quedan pocos
+    # 4. Prefiltro suave si quedan pocos
     TARGET_MIN = 120
     if len(tech_ok) < TARGET_MIN:
-        log(f"⚠ Solo {len(tech_ok)} candidatos con filtro estricto, aplicando filtro suave...")
+        log(f"⚠ Solo {len(tech_ok)} con filtro estricto, aplicando filtro suave...")
         tech_ok = []
         for tk, hist in hist_map.items():
             price = float(hist["Close"].iloc[-1])
@@ -589,15 +752,12 @@ def run_analysis():
                 tech_ok.append((tk, price, tech))
 
     tech_ok = tech_ok[:MAX_FUND_REQS]
-    log(f"✓ Candidatos técnicos: {len(tech_ok)}")
+    log(f"✓ Candidatos post-filtro técnico: {len(tech_ok)}")
 
-    # 5. Análisis fundamental
-    log("💰 Analizando fundamentales y calculando DCF...")
+    # 5. Fundamentales + DCF + Scoring
+    log("💰 Analizando fundamentales, DCF y scores...")
     rows = []
-    for idx, (tk, price, tech) in enumerate(tech_ok):
-        if (idx + 1) % 20 == 0:
-            log(f"  Procesando {idx + 1}/{len(tech_ok)}...")
-        
+    for idx, (tk, price, tech) in enumerate(tqdm(tech_ok, desc="Fundamentales")):
         fund = get_fundamentals_and_quality(tk)
         six, fund_d, tech_d, score, bonus = evaluate_conditions(fund, tech)
         bscore = buffett_score(fund, price, tech)
@@ -611,27 +771,27 @@ def run_analysis():
                 mos = None
         
         rows.append({
-            "ticker": tk, 
+            "ticker": tk,
             "price": round(price, 2),
-            "score6": score, 
+            "score6": score,
             "buffett_score": bscore,
-            "pe": fund.get("pe"), 
-            "pb": fund.get("pb"), 
+            "pe": fund.get("pe"),
+            "pb": fund.get("pb"),
             "roe": fund.get("roe"),
-            "roic": fund.get("roic"), 
+            "roic": fund.get("roic"),
             "gross_margin": fund.get("gross_margin"),
-            "op_margin": fund.get("op_margin"), 
+            "op_margin": fund.get("op_margin"),
             "net_margin": fund.get("net_margin"),
-            "rev_cagr": fund.get("rev_cagr"), 
+            "rev_cagr": fund.get("rev_cagr"),
             "ni_cagr": fund.get("ni_cagr"),
-            "debt_ebitda": fund.get("debt_ebitda"), 
+            "debt_ebitda": fund.get("debt_ebitda"),
             "fcf_positive": fund.get("fcf_positive"),
-            "intrinsic": intrinsic, 
+            "intrinsic": intrinsic,
             "mos": mos,
-            "trend_up": tech["trend_up"], 
-            "rsi_ok": tech["rsi_ok"], 
+            "trend_up": tech["trend_up"],
+            "rsi_ok": tech["rsi_ok"],
             "macd_up": tech["macd_up"],
-            "obv_up": tech.get("obv_up", False), 
+            "obv_up": tech.get("obv_up", False),
             "atr_pct": tech.get("atr_pct", np.nan),
             "volume_up": tech["volume_up"]
         })
@@ -646,29 +806,34 @@ def run_analysis():
             "from_cache": False,
             "generated_at": datetime.now().isoformat()
         }
-        log("❌ Error: Sin resultados")
-        # NO guardar en caché si hay error
+        log("❌ Sin resultados finales")
         return error_result
     
-    # 6. Ordenar y filtrar candidatos
+    # 6. Ordenar (Buffett → score6 → ROIC)
     log("🏆 Ordenando resultados...")
     df = df.sort_values(["buffett_score", "score6", "roic"], ascending=[False, False, False]).reset_index(drop=True)
 
+    # 7. Filtrar candidatos
     candidates = df[(df["buffett_score"] >= 7) | (df["score6"] >= SCORE_MIN)].copy()
     if candidates.empty:
-        log("⚠ No hay candidatos con criterios estrictos, relajando filtros...")
+        log("⚠ Relajando filtros (Buffett≥6 o score≥4)...")
         candidates = df[(df["buffett_score"] >= 6) | (df["score6"] >= 4)].copy()
 
-    # 7. Preparar resultado
+    # 8. Diagnóstico de NaN (como el original)
+    missing_cols = ["intrinsic","rev_cagr","ni_cagr","roic","debt_ebitda","pe","pb"]
+    diag = {c: df[c].isna().mean() for c in missing_cols if c in df.columns}
+    log("📊 NaN en campos clave: " + str({k: f"{v*100:.1f}%" for k,v in diag.items()}))
+
+    # 9. Resultado final
     execution_time = round(time.time() - start_time, 2)
     
-    # Reemplazar NaN con None para JSON válido
-    top_10_data = candidates.head(10).replace({np.nan: None}).to_dict('records')
+    top_50_data = candidates.head(50).replace({np.nan: None}).to_dict('records')
     
     result = {
         "total_analyzed": len(df),
         "candidates_count": len(candidates),
-        "top_10": top_10_data,
+        "top_50": top_50_data,
+        "nan_diagnostics": {k: f"{v*100:.1f}%" for k,v in diag.items()},
         "generated_at": datetime.now().isoformat(),
         "cache_enabled": GCS_AVAILABLE,
         "from_cache": False,
@@ -693,11 +858,19 @@ app = Flask(__name__)
 def home():
     cache_status = "enabled" if GCS_AVAILABLE else "disabled"
     return jsonify({
-        "status": "Warren Screener API v2.0 (Cloud Storage Cache)",
-        "version": "2.0",
+        "status": "Warren Screener API v3.0 (Lógica Original Completa)",
+        "version": "3.0",
         "cache": cache_status,
         "bucket": GCS_BUCKET_NAME if GCS_AVAILABLE else "not configured",
         "cache_ttl_hours": CACHE_TTL_HOURS,
+        "improvements": [
+            "Cálculo TTM completo desde quarterly statements",
+            "CAGR con fallbacks (5→3→2 años)",
+            "safe_get() robusto para múltiples nombres de campos",
+            "Threads=False y auto_adjust=False en descarga",
+            "Lógica DCF idéntica al script original",
+            "Top 50 resultados en lugar de top 10"
+        ],
         "endpoints": {
             "/analyze": "Run analysis (with 24h cache)",
             "/cache-status": "Check cache status",
@@ -716,9 +889,11 @@ def analyze():
         
         results = run_analysis()
         
-        # Asegurar que el JSON sea válido (sin NaN, Infinity, etc.)
         response = app.response_class(
-            response=json.dumps(results, default=str, allow_nan=False).replace('NaN', 'null').replace('Infinity', 'null').replace('-Infinity', 'null'),
+            response=json.dumps(results, default=str, allow_nan=False)
+                     .replace('NaN', 'null')
+                     .replace('Infinity', 'null')
+                     .replace('-Infinity', 'null'),
             status=200,
             mimetype='application/json'
         )
@@ -735,7 +910,7 @@ def cache_status():
     """Verifica el estado del caché"""
     if not GCS_AVAILABLE:
         return jsonify({
-            "cache_enabled": False, 
+            "cache_enabled": False,
             "message": "Cloud Storage not available"
         })
     
@@ -803,12 +978,14 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "cache_available": GCS_AVAILABLE
+        "cache_available": GCS_AVAILABLE,
+        "version": "3.0 - Original Logic"
     })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     log(f"🚀 Iniciando Warren Screener en puerto {port}")
+    log(f"📦 Versión: 3.0 (Lógica Original Completa)")
     log(f"💾 Cache: {'Enabled' if GCS_AVAILABLE else 'Disabled'}")
     if GCS_AVAILABLE:
         log(f"🪣 Bucket: {GCS_BUCKET_NAME}")

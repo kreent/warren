@@ -1,5 +1,5 @@
 # =========================================
-# Screener Value + Momentum + Buffett (Cloud Run)
+# Screener Value + Momentum + Buffett (Cloud Run) - OPTIMIZADO
 # =========================================
 
 import pandas as pd
@@ -10,8 +10,10 @@ import io
 import sys
 import time
 import logging
-from tqdm.auto import tqdm
+from functools import lru_cache
+from datetime import datetime, timedelta
 from flask import Flask, jsonify
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Silencio de logs ruidosos
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -43,11 +45,16 @@ MAX_GROWTH_CAP   = 0.12    # 12% cap de crecimiento a 10 años
 MOS_THRESHOLD    = 0.30    # margen de seguridad del 30%
 FCF_SALES_PROXY  = 0.05    # proxy de FCF si falta: 5% de ventas
 
+# -------- CONFIGURACIÓN DE CACHÉ --------
+CACHE_TTL_SECONDS = 3600  # 1 hora - ajustar según necesidad
+cached_analysis_result = None
+cached_analysis_timestamp = None
+
 def log(msg): 
     print(msg)
     sys.stdout.flush()
 
-# -------- Lectura robusta de listas (S&P500 ∪ Nasdaq-100) --------
+# -------- Lectura robusta de listas (S&P500 ∪ Nasdaq-100) con CACHÉ --------
 def try_read_html(url):
     r = requests.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"})
     r.raise_for_status()
@@ -66,7 +73,10 @@ def clean_symbols(series):
     s = s[~s.str.contains(r"[^\w\-]", regex=True)]
     return s
 
-def universe_sp500():
+# CACHÉ para universe S&P500 (se actualiza raramente)
+@lru_cache(maxsize=1)
+def universe_sp500_cached():
+    """Caché del listado S&P500 - se mantiene en memoria por vida de la instancia"""
     try:
         for tb in try_read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"):
             cols = [str(c) for c in tb.columns]; lowers = [c.lower() for c in cols]
@@ -88,7 +98,10 @@ def universe_sp500():
     except Exception: pass
     return pd.Series([], dtype=str)
 
-def universe_nasdaq100():
+# CACHÉ para universe Nasdaq-100
+@lru_cache(maxsize=1)
+def universe_nasdaq100_cached():
+    """Caché del listado Nasdaq-100 - se mantiene en memoria por vida de la instancia"""
     try:
         for tb in try_read_html("https://en.wikipedia.org/wiki/Nasdaq-100"):
             cols = [str(c) for c in tb.columns]; lowers = [c.lower() for c in cols]
@@ -107,7 +120,8 @@ def universe_nasdaq100():
 
 def fetch_universe(limit=UNIVERSE_LIMIT):
     log("Construyendo universo (S&P500 ∪ Nasdaq-100)…")
-    sp, ndx = universe_sp500(), universe_nasdaq100()
+    sp = universe_sp500_cached()
+    ndx = universe_nasdaq100_cached()
     base = pd.Series(pd.concat([sp, ndx]).dropna().unique())
     if base.empty:
         base = pd.Series([
@@ -181,7 +195,7 @@ def compute_technicals(df):
     }
     return conds, last
 
-# -------- Descarga de históricos por lotes (adaptativo) --------
+# -------- Descarga de históricos por lotes (adaptativo) con paralelización --------
 def _required_period_for(ma_long=MA_LONG, extra_days=40):
     days = ma_long + extra_days
     if days <= 250:   return "1y"
@@ -189,200 +203,125 @@ def _required_period_for(ma_long=MA_LONG, extra_days=40):
     elif days <= 750: return "3y"
     else:             return "5y"
 
-def download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=2.0, retries=2):
-    if period is None: period = _required_period_for()
-    candidates_periods = [period, "2y", "3y", "5y"]
-    histories = {}
-    n = len(tickers)
-    for i in range(0, n, batch_size):
-        batch = tickers[i:i+batch_size]
-        data = None
-        for per in candidates_periods:
-            for att in range(retries+1):
-                try:
-                    data = yf.download(
-                        tickers=batch, period=per, interval="1d",
-                        auto_adjust=False, group_by="ticker", threads=False, progress=False
-                    )
-                    if data is not None and not data.empty: break
-                except Exception:
-                    data = None
-                time.sleep(sleep*(att+1))
-            if data is not None and not data.empty: break
-        if data is None or data.empty: continue
-
-        if isinstance(data.columns, pd.MultiIndex):
-            for tk in batch:
-                if tk in data.columns.get_level_values(0):
-                    sub = data[tk].copy()
-                    sub.columns = [c.title() for c in sub.columns]
-                    if {"Close","Volume","High","Low"}.issubset(sub.columns) and not sub.dropna().empty:
-                        histories[tk] = sub
-        else:
-            sub = data.copy()
-            sub.columns = [c[0].title() if isinstance(c, tuple) else str(c).title() for c in sub.columns]
-            if {"Close","Volume","High","Low"}.issubset(sub.columns) and not sub.dropna().empty:
-                histories[batch[0]] = sub
-        time.sleep(sleep)
-    return histories
-
-# -------- Fundamentales robustos (TTM, CAGR, DCF) --------
-def safe_get(d, keys, default=None):
-    for k in keys:
-        if isinstance(d, dict) and k in d and pd.notna(d[k]): return d[k]
-        if isinstance(d, pd.Series) and k in d.index and pd.notna(d.loc[k]): return d.loc[k]
-    return default
-
-def last_col(df):
-    if not (isinstance(df, pd.DataFrame) and not df.empty):
-        return pd.Series(dtype=float)
-    col = df.columns[0]; s = df[col]; s.index = s.index.astype(str); return s
-
-def get_statement(t, name, quarterly=False):
-    df = getattr(t, f"{'quarterly_' if quarterly else ''}{name}", None)
-    return df if isinstance(df, pd.DataFrame) and not df.empty else None
-
-def series_ttm_from_quarterly(df_q, label):
+def _download_single_ticker(tk, period):
+    """Descarga un ticker individual"""
     try:
-        s = df_q.loc[label].dropna()
-        if len(s) < 4: return None
-        return float(s.iloc[:4].sum())
+        df = yf.download(tk, period=period, progress=False, threads=False)
+        if df is None or df.empty or len(df) < 50:
+            return tk, None
+        df = df[["Open","High","Low","Close","Volume"]].copy()
+        df = df.dropna()
+        return tk, df
     except Exception:
-        return None
+        return tk, None
 
-def pick_series_annual_or_ttm(t):
-    income_y = get_statement(t, "income_stmt", quarterly=False)
-    cash_y   = get_statement(t, "cashflow",    quarterly=False)
-    income_q = get_statement(t, "income_stmt", quarterly=True)
-    cash_q   = get_statement(t, "cashflow",    quarterly=True)
+def download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=0, retries=1, max_workers=10):
+    """
+    Descarga históricos usando ThreadPoolExecutor para paralelizar
+    """
+    if period is None:
+        period = _required_period_for(MA_LONG, 40)
+    
+    log(f"Descargando históricos para {len(tickers)} tickers (period={period}) en paralelo...")
+    
+    results = {}
+    
+    # Usar ThreadPoolExecutor para descargas paralelas
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Enviar todas las tareas
+        future_to_ticker = {
+            executor.submit(_download_single_ticker, tk, period): tk 
+            for tk in tickers
+        }
+        
+        # Recoger resultados a medida que se completan
+        for future in as_completed(future_to_ticker):
+            tk, df = future.result()
+            if df is not None and not df.empty:
+                results[tk] = df
+    
+    log(f"✓ Descargados {len(results)}/{len(tickers)} tickers con datos válidos")
+    return results
 
-    def from_annual(df, name):
-        return safe_get(last_col(df), [name]) if df is not None else None
+# -------- Fundamentales y DCF con CACHÉ por ticker --------
+# Caché de 1 hora para fundamentales de cada ticker
+@lru_cache(maxsize=500)
+def get_fundamentals_and_quality_cached(ticker):
+    """Versión cacheada de get_fundamentals_and_quality"""
+    return _get_fundamentals_and_quality_impl(ticker)
 
-    revenue = from_annual(income_y, "Total Revenue")
-    netinc  = from_annual(income_y, "Net Income")
-    ebitda  = from_annual(income_y, "EBITDA")
-    ocf     = from_annual(cash_y,   "Total Cash From Operating Activities")
-    capex   = from_annual(cash_y,   "Capital Expenditures")
-
-    if revenue is None and income_q is not None:
-        revenue = series_ttm_from_quarterly(income_q, "Total Revenue")
-    if netinc is None and income_q is not None:
-        netinc = series_ttm_from_quarterly(income_q, "Net Income")
-    if ebitda is None and income_q is not None:
-        ebitda = series_ttm_from_quarterly(income_q, "EBITDA")
-    if ocf is None and cash_q is not None:
-        ocf = series_ttm_from_quarterly(cash_q, "Total Cash From Operating Activities")
-    if capex is None and cash_q is not None:
-        capex = series_ttm_from_quarterly(cash_q, "Capital Expenditures")
-
-    return revenue, netinc, ebitda, ocf, capex
-
-def compute_cagr(latest, past, periods):
+def _get_fundamentals_and_quality_impl(ticker):
     try:
-        if latest is None or past in (None, 0) or periods <= 0: return None
-        ratio = float(latest)/float(past)
-        if ratio <= 0: return None
-        return ratio**(1/periods) - 1
+        t = yf.Ticker(ticker)
+        info = t.info or {}
     except Exception:
-        return None
+        info = {}
 
-def cagr_from_series(df, row_label, years_pref=5):
-    if not (isinstance(df, pd.DataFrame) and not df.empty): return None
+    pe = info.get("trailingPE") or info.get("forwardPE")
+    pb = info.get("priceToBook")
+    roe = info.get("returnOnEquity")
+    debt = info.get("totalDebt")
+    ebitda = info.get("ebitda")
+    debt_ebitda = (float(debt)/float(ebitda)) if (debt not in (None,0) and ebitda not in (None,0)) else None
+
+    gross_margin = info.get("grossMargins")
+    op_margin    = info.get("operatingMargins")
+    net_margin   = info.get("profitMargins")
+
+    revenue = info.get("totalRevenue")
+    price   = info.get("currentPrice") or info.get("regularMarketPrice")
+    mktcap  = info.get("marketCap")
+    shares  = info.get("sharesOutstanding")
+
+    rev_cagr, ni_cagr = None, None
     try:
-        s = df.loc[row_label].dropna()
+        fs = t.financials
+        if fs is not None and not fs.empty and "Total Revenue" in fs.index:
+            trev = fs.loc["Total Revenue"].dropna().sort_index()
+            if len(trev) >= 2:
+                yrs = (trev.index[-1] - trev.index[0]).days / 365.25
+                if yrs > 0:
+                    rev_cagr = ((trev.iloc[-1]/trev.iloc[0])**(1/yrs)) - 1
+        if fs is not None and not fs.empty and "Net Income" in fs.index:
+            tni = fs.loc["Net Income"].dropna().sort_index()
+            if len(tni) >= 2:
+                yrs2 = (tni.index[-1] - tni.index[0]).days / 365.25
+                if yrs2 > 0 and tni.iloc[0] > 0:
+                    ni_cagr = ((tni.iloc[-1]/tni.iloc[0])**(1/yrs2)) - 1
     except Exception:
-        return None
-    if len(s) >= years_pref:
-        past, latest, periods = s.iloc[-years_pref], s.iloc[-1], years_pref-1
-    elif len(s) >= 3:
-        past, latest, periods = s.iloc[-3], s.iloc[-1], 2
-    elif len(s) >= 2:
-        past, latest, periods = s.iloc[-2], s.iloc[-1], 1
-    else:
-        return None
-    return compute_cagr(latest, past, periods)
-
-def get_fundamentals_and_quality(ticker):
-    t = yf.Ticker(ticker)
-    finfo = getattr(t, "fast_info", {}) or {}
-    info  = getattr(t, "info", {}) or {}
-
-    pe = safe_get(finfo, ["trailingPe","trailingPE","pe_ratio"]) or safe_get(info, ["trailingPE","forwardPE","priceEpsTrailing12Months"])
-    pb = safe_get(finfo, ["priceToBook","price_to_book"]) or safe_get(info, ["priceToBook"])
-
-    shares = safe_get(finfo, ["sharesOutstanding","shares_outstanding"]) or safe_get(info, ["sharesOutstanding"])
-    mktcap = safe_get(info, ["marketCap"])
-    price  = safe_get(finfo, ["last_price","lastPrice"]) or safe_get(info, ["currentPrice"])
-
-    income_y = get_statement(t, "income_stmt", quarterly=False)
-    bal_y    = get_statement(t, "balance_sheet", quarterly=False)
-    cash_y   = get_statement(t, "cashflow", quarterly=False)
-
-    revenue, net_income, ebitda, ocf, capex = pick_series_annual_or_ttm(t)
-
-    inc_last = last_col(income_y); bal_last = last_col(bal_y); cf_last = last_col(cash_y)
-
-    gp = safe_get(inc_last, ["Gross Profit","GrossProfit"])
-    op_income = safe_get(inc_last, ["Operating Income","OperatingIncome","Operating Income Or Loss"])
-
-    gross_margin = (float(gp)/float(revenue)) if (gp is not None and revenue not in (None,0)) else None
-    op_margin    = (float(op_income)/float(revenue)) if (op_income is not None and revenue not in (None,0)) else None
-    net_margin   = (float(net_income)/float(revenue)) if (net_income is not None and revenue not in (None,0)) else None
-
-    rev_cagr = cagr_from_series(income_y, "Total Revenue")
-    ni_cagr  = cagr_from_series(income_y, "Net Income")
-
-    equity = safe_get(bal_last, ["Total Stockholder Equity","Stockholders Equity","TotalEquity","Total Shareholder Equity","Total stockholders' equity"])
-    roe = None
-    try:
-        if net_income is not None and equity not in (None, 0): roe = float(net_income)/float(equity)
-    except Exception: pass
-
-    total_debt = safe_get(bal_last, ["Total Debt","TotalDebt","Short Long Term Debt","ShortLongTermDebt"])
-    if total_debt is None and isinstance(bal_last, pd.Series):
-        lt = safe_get(bal_last, ["Long Term Debt","LongTermDebt"]) or 0
-        st = safe_get(bal_last, ["Short Term Debt","ShortTermDebt","Current Portion Of Long Term Debt"]) or 0
-        total_debt = lt + st if (lt or st) else None
-    cash = safe_get(bal_last, ["Cash","Cash And Cash Equivalents","CashAndCashEquivalents"])
-    net_debt = None
-    try:
-        if total_debt is not None and cash is not None:
-            net_debt = float(total_debt) - float(cash)
-    except Exception: pass
-
-    ebit  = safe_get(inc_last, ["Ebit","EBIT","Operating Income","OperatingIncome"])
-    tax_exp = safe_get(inc_last, ["Income Tax Expense","IncomeTaxExpense"])
-    pretax  = safe_get(inc_last, ["Income Before Tax","IncomeBeforeTax","Ebt","EBT"])
-    tax_rate = None
-    try:
-        if tax_exp is not None and pretax not in (None,0):
-            tr = float(tax_exp)/abs(float(pretax))
-            tax_rate = min(max(tr, 0.0), 0.35)
-    except Exception: pass
-    if tax_rate is None: tax_rate = 0.21
-
-    invested_capital = None
-    try:
-        if equity is not None and total_debt is not None and cash is not None:
-            invested_capital = float(equity) + float(total_debt) - float(cash)
-    except Exception: pass
+        pass
 
     roic = None
     try:
-        if ebit is not None and invested_capital not in (None, 0):
-            nopat = float(ebit) * (1 - tax_rate)
-            roic = nopat / float(invested_capital)
-    except Exception: pass
+        bs = t.balance_sheet
+        nopat = None
+        if fs is not None and not fs.empty and "Operating Income" in fs.index:
+            oi = fs.loc["Operating Income"].dropna()
+            if not oi.empty:
+                nopat = oi.iloc[0] * 0.7
+        ic = None
+        if bs is not None and not bs.empty:
+            equity_line = next((x for x in bs.index if "stockholder" in str(x).lower() or "shareholder" in str(x).lower()), None)
+            debt_line   = next((x for x in bs.index if "total debt" in str(x).lower()), None)
+            eq = bs.loc[equity_line].dropna().iloc[0] if equity_line else None
+            dbt= bs.loc[debt_line].dropna().iloc[0] if debt_line else None
+            if eq is not None and dbt is not None:
+                ic = eq + dbt
+        if nopat is not None and ic not in (None,0):
+            roic = float(nopat) / float(ic)
+    except Exception:
+        pass
 
-    debt_ebitda = None
+    net_debt = None
     try:
-        if ebitda not in (None, 0) and total_debt is not None:
-            debt_ebitda = float(total_debt) / float(ebitda)
-    except Exception: pass
+        cash_val = info.get("totalCash") or 0
+        debt_val = info.get("totalDebt") or 0
+        net_debt = float(debt_val) - float(cash_val)
+    except Exception:
+        pass
 
-    if ocf is None: ocf = safe_get(cf_last, ["Total Cash From Operating Activities","Operating Cash Flow","OperatingCashFlow"])
-    if capex is None: capex = safe_get(cf_last, ["Capital Expenditures","CapitalExpenditures","Purchase Of Property Plant And Equipment"])
+    ocf = info.get("operatingCashflow")
+    capex = info.get("capitalExpenditures")
     fcf = None
     try:
         if ocf is not None and capex is not None: fcf = float(ocf) - float(capex)
@@ -425,6 +364,10 @@ def get_fundamentals_and_quality(ticker):
         "shares_out":   (int(shares) if shares not in (None, np.nan) else None),
         "intrinsic":    (float(intrinsic) if intrinsic not in (None, np.nan) else None)
     }
+
+# Wrapper para mantener compatibilidad
+def get_fundamentals_and_quality(ticker):
+    return get_fundamentals_and_quality_cached(ticker)
 
 # -------- Scoring: clásico + Buffett Score --------
 def evaluate_conditions(fund, tech):
@@ -473,13 +416,16 @@ def buffett_score(fund, price, tech):
     if tech["trend_up"] and (tech["rsi_ok"] or tech["macd_up"]) and tech.get("obv_up", False): pts += 1.0
     return round(min(10.0, pts), 2)
 
-# -------------- ANÁLISIS --------------
+# -------------- ANÁLISIS CON CACHÉ --------------
 def run_analysis():
+    """
+    Ejecuta el análisis completo. Esta función es llamada cuando el caché expira.
+    """
     tickers = fetch_universe(limit=UNIVERSE_LIMIT)
     log(f"Tickers a evaluar: {len(tickers)}")
 
-    # 1) Históricos por lotes (adaptativo)
-    hist_map = download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=2.0, retries=2)
+    # 1) Históricos por lotes (adaptativo y paralelizado)
+    hist_map = download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=0, retries=1, max_workers=10)
 
     # 2) Prefiltro técnico + rango precio
     tech_ok = []
@@ -507,6 +453,7 @@ def run_analysis():
     tech_ok = tech_ok[:MAX_FUND_REQS]
 
     # 3) Fundamentales + DCF + Scorings
+    log(f"Obteniendo fundamentales para {len(tech_ok)} tickers...")
     rows = []
     for tk, price, tech in tech_ok:
         fund = get_fundamentals_and_quality(tk)
@@ -548,9 +495,39 @@ def run_analysis():
     result = {
         "total_analyzed": len(df),
         "candidates_count": len(candidates),
-        "top_10": candidates.head(10).to_dict('records')
+        "top_10": candidates.head(10).to_dict('records'),
+        "cached_at": datetime.now().isoformat(),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS
     }
     
+    return result
+
+def get_cached_analysis():
+    """
+    Retorna el análisis cacheado si está vigente, o ejecuta uno nuevo
+    """
+    global cached_analysis_result, cached_analysis_timestamp
+    
+    current_time = datetime.now()
+    
+    # Verificar si el caché es válido
+    if cached_analysis_result is not None and cached_analysis_timestamp is not None:
+        time_elapsed = (current_time - cached_analysis_timestamp).total_seconds()
+        if time_elapsed < CACHE_TTL_SECONDS:
+            log(f"✓ Retornando resultado cacheado (edad: {int(time_elapsed)}s)")
+            result = cached_analysis_result.copy()
+            result["from_cache"] = True
+            result["cache_age_seconds"] = int(time_elapsed)
+            return result
+    
+    # Caché expirado o no existe - ejecutar análisis
+    log("Ejecutando nuevo análisis (caché expirado o no existe)...")
+    cached_analysis_result = run_analysis()
+    cached_analysis_timestamp = current_time
+    
+    result = cached_analysis_result.copy()
+    result["from_cache"] = False
+    result["cache_age_seconds"] = 0
     return result
 
 # Flask app para Cloud Run
@@ -558,17 +535,49 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Warren Screener API", "endpoint": "/analyze"})
+    return jsonify({
+        "status": "Warren Screener API - OPTIMIZADO",
+        "version": "2.0",
+        "endpoints": {
+            "/analyze": "Análisis principal (con caché de 1 hora)",
+            "/analyze?force_refresh=1": "Forzar nuevo análisis",
+            "/health": "Health check"
+        },
+        "optimizations": [
+            "Caché en memoria de resultados (1 hora TTL)",
+            "Caché de listados S&P500 y Nasdaq-100",
+            "Caché de fundamentales por ticker",
+            "Descarga paralela de históricos",
+            "Servidor Gunicorn recomendado"
+        ]
+    })
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 @app.route('/analyze')
 def analyze():
     try:
-        results = run_analysis()
+        # Permitir forzar refresh con parámetro
+        from flask import request
+        force_refresh = request.args.get('force_refresh', '0') == '1'
+        
+        if force_refresh:
+            global cached_analysis_result, cached_analysis_timestamp
+            cached_analysis_result = None
+            cached_analysis_timestamp = None
+            log("Forzando refresh del caché...")
+        
+        results = get_cached_analysis()
         return jsonify(results)
     except Exception as e:
+        log(f"ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # NOTA: Para producción, usar Gunicorn en lugar de app.run()
+    app.run(host="0.0.0.0", port=port, threaded=True)

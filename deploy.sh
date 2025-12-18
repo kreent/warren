@@ -6,7 +6,7 @@
 set -e  # Salir si hay algún error
 
 # Configuración
-PROJECT_ID="19630f83-fd0f-4611-8547-c6aea71e3893"  # CAMBIAR por tu project ID
+PROJECT_ID="tu-proyecto-id"  # CAMBIAR por tu project ID
 REGION="europe-west1"
 SERVICE_NAME="warren-screener"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest"

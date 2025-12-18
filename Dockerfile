@@ -11,8 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar código de la aplicación
-# IMPORTANTE: Asegúrate de que el archivo se llame 'main.py' en tu proyecto
-COPY main.py .
+COPY main_optimized.py main.py
 
 # Configurar variables de entorno
 ENV PORT=8080

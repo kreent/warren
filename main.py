@@ -827,12 +827,12 @@ def run_analysis():
     # 9. Resultado final
     execution_time = round(time.time() - start_time, 2)
     
-    top_50_data = candidates.head(50).replace({np.nan: None}).to_dict('records')
+    top_10_data = candidates.head(10).replace({np.nan: None}).to_dict('records')
     
     result = {
-        "total_analyzed": len(df),
         "candidates_count": len(candidates),
-        "top_50": top_50_data,
+        "total_analyzed": len(df),
+        "top_10": top_10_data,
         "nan_diagnostics": {k: f"{v*100:.1f}%" for k,v in diag.items()},
         "generated_at": datetime.now().isoformat(),
         "cache_enabled": GCS_AVAILABLE,
@@ -869,7 +869,7 @@ def home():
             "safe_get() robusto para múltiples nombres de campos",
             "Threads=False y auto_adjust=False en descarga",
             "Lógica DCF idéntica al script original",
-            "Top 50 resultados en lugar de top 10"
+            "Top 10 mejores resultados"
         ],
         "endpoints": {
             "/analyze": "Run analysis (with 24h cache)",

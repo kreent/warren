@@ -910,6 +910,137 @@ def buffett_score(fund, price, tech):
 
     return round(min(10.0, pts), 2)
 
+# -------- ANÁLISIS ESTILO ORACLE V7 (SIN FILTROS TÉCNICOS) --------
+def run_oracle_analysis():
+    """
+    Análisis puro fundamental estilo Oracle V7:
+    - NO usa filtros técnicos
+    - Solo filtra por ROIC >= 8%, Piotroski >= 5, MOS >= -20%
+    - Más rápido y simple que run_analysis()
+    """
+    log("="*60)
+    log("⏳ Iniciando Oracle V7 Analysis (Pure Fundamental)...")
+    log("="*60)
+    start_time = time.time()
+
+    MIN_ROIC = 0.08
+    MIN_PIOTROSKI = 5
+    MIN_MOS_VIEW = -0.20
+    MIN_MARKET_CAP = 5_000_000_000
+
+    # 1. Universo
+    tickers = fetch_universe(limit=UNIVERSE_LIMIT)
+    log(f"📋 Tickers a analizar: {len(tickers)}")
+
+    # 2. Análisis directo (sin históricos técnicos)
+    log("💰 Analizando fundamentales estilo Oracle V7...")
+    results = []
+
+    for tk in tqdm(tickers, desc="Oracle V7 Analysis"):
+        try:
+            t = yf.Ticker(tk)
+
+            # Filtro rápido de market cap
+            try:
+                fast = t.fast_info
+                if fast.market_cap < MIN_MARKET_CAP:
+                    continue
+                price = fast.last_price
+            except:
+                continue
+
+            # Obtener statements
+            income_y = get_statement(t, "income_stmt", quarterly=False)
+            bal_y = get_statement(t, "balance_sheet", quarterly=False)
+            cash_y = get_statement(t, "cashflow", quarterly=False)
+
+            if income_y is None or bal_y is None or cash_y is None:
+                continue
+
+            # Métricas básicas
+            fund = get_fundamentals_and_quality(tk)
+
+            roic = fund.get("roic")
+            piotroski = fund.get("piotroski", 5)
+            intrinsic_roic = fund.get("intrinsic_roic")
+
+            # Filtros Oracle V7
+            if roic is None or roic < MIN_ROIC:
+                continue
+
+            if piotroski < MIN_PIOTROSKI:
+                continue
+
+            # Calcular MOS con método ROIC (Oracle V7 style)
+            if intrinsic_roic is not None and intrinsic_roic > 0 and price is not None:
+                mos = (intrinsic_roic - price) / intrinsic_roic
+            else:
+                continue
+
+            # Filtro de salida más laxo
+            if mos < MIN_MOS_VIEW and piotroski < 7:
+                continue
+
+            # Growth estimation (Oracle V7 style)
+            roic_growth = fund.get("roic_growth", 0.05)
+
+            results.append({
+                "Ticker": tk,
+                "Price": round(price, 2),
+                "Sector": t.info.get('sector', 'N/A'),
+                "ROIC": roic,
+                "Piotroski": piotroski,
+                "Growth_Est": roic_growth,
+                "Intrinsic": intrinsic_roic,
+                "MOS": mos
+            })
+
+        except Exception as e:
+            continue
+
+    if not results:
+        return {
+            "error": "Sin resultados",
+            "total_analyzed": len(tickers),
+            "candidates_count": 0,
+            "results": [],
+            "generated_at": datetime.now().isoformat(),
+            "execution_time_seconds": round(time.time() - start_time, 2)
+        }
+
+    # Ordenar por MOS descendente
+    results_sorted = sorted(results, key=lambda x: x['MOS'], reverse=True)
+
+    # Clasificar por zonas
+    buy_zone = [r for r in results_sorted if r['MOS'] > 0.10]
+    fair_zone = [r for r in results_sorted if 0 <= r['MOS'] <= 0.10]
+    watch_zone = [r for r in results_sorted if -0.20 <= r['MOS'] < 0]
+
+    execution_time = round(time.time() - start_time, 2)
+
+    result = {
+        "total_analyzed": len(tickers),
+        "candidates_count": len(results_sorted),
+        "results": results_sorted,
+        "summary": {
+            "buy_zone_count": len(buy_zone),
+            "fair_zone_count": len(fair_zone),
+            "watch_zone_count": len(watch_zone)
+        },
+        "generated_at": datetime.now().isoformat(),
+        "cache_enabled": GCS_AVAILABLE,
+        "from_cache": False,
+        "execution_time_seconds": execution_time
+    }
+
+    log("="*60)
+    log(f"✅ Oracle V7 Analysis completado en {execution_time}s")
+    log(f"📊 Total analizados: {len(tickers)}")
+    log(f"⭐ Candidatos finales: {len(results_sorted)}")
+    log("="*60)
+
+    return result
+
 # -------- PIPELINE PRINCIPAL (IDÉNTICO AL ORIGINAL) --------
 def run_analysis():
     """Ejecuta el análisis completo del screener"""
@@ -1110,6 +1241,124 @@ def run_analysis():
     
     return result
 
+# -------- POST-PROCESAMIENTO PARA ORACLE V7 --------
+def post_process_oracle_results(results_data):
+    """Genera análisis adicional estilo Oracle V7"""
+    results = results_data.get("results", [])
+
+    if not results:
+        return results_data
+
+    # Sector analysis
+    sectors = {}
+    for r in results:
+        sector = r.get("Sector", "N/A")
+        if sector not in sectors:
+            sectors[sector] = {
+                "count": 0,
+                "avg_mos": [],
+                "avg_roic": [],
+                "avg_piotroski": [],
+                "stocks": []
+            }
+        sectors[sector]["count"] += 1
+        sectors[sector]["avg_mos"].append(r["MOS"])
+        sectors[sector]["avg_roic"].append(r["ROIC"])
+        sectors[sector]["avg_piotroski"].append(r["Piotroski"])
+        sectors[sector]["stocks"].append(r)
+
+    sector_analysis = {}
+    for sector, data in sectors.items():
+        sector_analysis[sector] = {
+            "count": data["count"],
+            "avg_mos": sum(data["avg_mos"]) / len(data["avg_mos"]),
+            "avg_roic": sum(data["avg_roic"]) / len(data["avg_roic"]),
+            "avg_piotroski": int(sum(data["avg_piotroski"]) / len(data["avg_piotroski"])),
+            "best_pick": max(data["stocks"], key=lambda x: x["MOS"])
+        }
+
+    # Top opportunities
+    top_10_mos = sorted(results, key=lambda x: x["MOS"], reverse=True)[:10]
+    top_10_roic = sorted(results, key=lambda x: x["ROIC"], reverse=True)[:10]
+    top_10_piotroski = sorted(results, key=lambda x: (x["Piotroski"], x["MOS"]), reverse=True)[:10]
+
+    # Alerts
+    alerts = []
+    for r in results:
+        # Super bargain
+        if r["MOS"] > 0.50:
+            alerts.append({
+                "type": "SUPER_BARGAIN",
+                "severity": "HIGH",
+                "ticker": r["Ticker"],
+                "message": f"{r['Ticker']}: MOS de {r['MOS']*100:.1f}% - ¡Oportunidad excepcional!",
+                "data": r
+            })
+
+        # Quality excellence
+        if r["Piotroski"] >= 5 and r["ROIC"] > 0.30:
+            alerts.append({
+                "type": "QUALITY_EXCELLENCE",
+                "severity": "MEDIUM",
+                "ticker": r["Ticker"],
+                "message": f"{r['Ticker']}: Calidad excepcional - Piotroski {r['Piotroski']}, ROIC {r['ROIC']*100:.1f}%",
+                "data": r
+            })
+
+        # High growth
+        if r["Growth_Est"] >= 0.12:
+            alerts.append({
+                "type": "HIGH_GROWTH",
+                "severity": "MEDIUM",
+                "ticker": r["Ticker"],
+                "message": f"{r['Ticker']}: Alto potencial de crecimiento {r['Growth_Est']*100:.1f}%",
+                "data": r
+            })
+
+    # Watchlists
+    watchlist_aggressive = [r for r in results if r["MOS"] > 0.10][:11]
+    watchlist_balanced = sorted([r for r in results if r["MOS"] >= 0],
+                                key=lambda x: (x["ROIC"], x["MOS"]), reverse=True)[:15]
+    watchlist_conservative = [r for r in results if r["MOS"] > 0.20 and r["Piotroski"] >= 6]
+
+    # Portfolio metrics
+    total_candidates = len(results)
+    buy_zone = [r for r in results if r["MOS"] > 0.10]
+
+    portfolio_metrics = {
+        "total_candidates": total_candidates,
+        "buy_zone_count": len(buy_zone),
+        "avg_mos": sum(r["MOS"] for r in results) / len(results) if results else 0,
+        "avg_roic": sum(r["ROIC"] for r in results) / len(results) if results else 0,
+        "avg_piotroski": int(sum(r["Piotroski"] for r in results) / len(results)) if results else 0,
+        "median_price": sorted([r["Price"] for r in results])[len(results) // 2] if results else 0,
+        "total_intrinsic_value": sum(r["Intrinsic"] for r in results if r["Intrinsic"]),
+        "total_market_value": sum(r["Price"] for r in results),
+        "portfolio_discount": 0
+    }
+
+    if portfolio_metrics["total_market_value"] > 0:
+        portfolio_metrics["portfolio_discount"] = (
+            portfolio_metrics["total_intrinsic_value"] - portfolio_metrics["total_market_value"]
+        ) / portfolio_metrics["total_intrinsic_value"]
+
+    # Agregar post-processing
+    results_data["post_processed"] = {
+        "sector_analysis": sector_analysis,
+        "top_opportunities": {
+            "top_mos": top_10_mos,
+            "top_roic": top_10_roic,
+            "top_piotroski": top_10_piotroski
+        },
+        "portfolio_metrics": portfolio_metrics,
+        "alerts": alerts,
+        "watchlist_aggressive": watchlist_aggressive,
+        "watchlist_balanced": watchlist_balanced,
+        "watchlist_conservative": watchlist_conservative
+    }
+
+    return results_data
+
 # -------- Flask App --------
 app = Flask(__name__)
 
@@ -1139,7 +1388,8 @@ def home():
             "Top 10 mejores resultados"
         ],
         "endpoints": {
-            "/analyze": "Run analysis (with 24h cache)",
+            "/analyze": "Run full analysis with technical filters (Warren style)",
+            "/oracle": "Run pure fundamental analysis (Oracle V7 style - NO technical filters)",
             "/cache-status": "Check cache status",
             "/clear-cache": "Clear cache manually",
             "/health": "Health check"
@@ -1168,6 +1418,35 @@ def analyze():
         
     except Exception as e:
         log(f"❌ Error en análisis: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/oracle')
+def oracle():
+    """Endpoint Oracle V7 - Análisis puro fundamental sin filtros técnicos"""
+    try:
+        log("\n" + "="*60)
+        log("🏛️ Nueva petición Oracle V7 recibida")
+        log("="*60)
+
+        results = run_oracle_analysis()
+
+        # Post-procesar para agregar análisis adicional
+        results = post_process_oracle_results(results)
+
+        response = app.response_class(
+            response=json.dumps(results, default=str, allow_nan=False)
+                     .replace('NaN', 'null')
+                     .replace('Infinity', 'null')
+                     .replace('-Infinity', 'null'),
+            status=200,
+            mimetype='application/json'
+        )
+        return response
+
+    except Exception as e:
+        log(f"❌ Error en Oracle V7 analysis: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500

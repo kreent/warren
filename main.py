@@ -910,14 +910,19 @@ def buffett_score(fund, price, tech):
 
     return round(min(10.0, pts), 2)
 
-# -------- ANÁLISIS ESTILO ORACLE V7 (SIN FILTROS TÉCNICOS) --------
-def run_oracle_analysis():
+# -------- PIPELINE PRINCIPAL - ORACLE V7 (SIN FILTROS TÉCNICOS) --------
+def run_analysis():
     """
-    Análisis puro fundamental estilo Oracle V7:
-    - NO usa filtros técnicos
-    - Solo filtra por ROIC >= 8%, Piotroski >= 5, MOS >= -20%
-    - Más rápido y simple que run_analysis()
+    Ejecuta análisis Oracle V7: Pure fundamental analysis
+    NO usa filtros técnicos - replica script de Colab exactamente
     """
+    # Intentar obtener del caché primero
+    cached_results = get_cached_results()
+    if cached_results is not None:
+        if isinstance(cached_results, dict):
+            cached_results["from_cache"] = True
+        return post_process_oracle_results(cached_results)
+
     log("="*60)
     log("⏳ Iniciando Oracle V7 Analysis (Pure Fundamental)...")
     log("="*60)
@@ -932,7 +937,7 @@ def run_oracle_analysis():
     tickers = fetch_universe(limit=UNIVERSE_LIMIT)
     log(f"📋 Tickers a analizar: {len(tickers)}")
 
-    # 2. Análisis directo (sin históricos técnicos)
+    # 2. Análisis directo (SIN históricos técnicos, SIN filtros técnicos)
     log("💰 Analizando fundamentales estilo Oracle V7...")
     results = []
 
@@ -957,7 +962,7 @@ def run_oracle_analysis():
             if income_y is None or bal_y is None or cash_y is None:
                 continue
 
-            # Métricas básicas
+            # Métricas fundamentales
             fund = get_fundamentals_and_quality(tk)
 
             roic = fund.get("roic")
@@ -984,10 +989,16 @@ def run_oracle_analysis():
             # Growth estimation (Oracle V7 style)
             roic_growth = fund.get("roic_growth", 0.05)
 
+            # Obtener sector
+            try:
+                sector = t.info.get('sector', 'N/A')
+            except:
+                sector = 'N/A'
+
             results.append({
                 "Ticker": tk,
                 "Price": round(price, 2),
-                "Sector": t.info.get('sector', 'N/A'),
+                "Sector": sector,
                 "ROIC": roic,
                 "Piotroski": piotroski,
                 "Growth_Est": roic_growth,
@@ -999,16 +1010,19 @@ def run_oracle_analysis():
             continue
 
     if not results:
-        return {
+        error_result = {
             "error": "Sin resultados",
             "total_analyzed": len(tickers),
             "candidates_count": 0,
             "results": [],
             "generated_at": datetime.now().isoformat(),
-            "execution_time_seconds": round(time.time() - start_time, 2)
+            "execution_time_seconds": round(time.time() - start_time, 2),
+            "from_cache": False
         }
+        log("❌ Sin resultados finales")
+        return error_result
 
-    # Ordenar por MOS descendente
+    # Ordenar por MOS descendente (como Oracle V7)
     results_sorted = sorted(results, key=lambda x: x['MOS'], reverse=True)
 
     # Clasificar por zonas
@@ -1039,206 +1053,12 @@ def run_oracle_analysis():
     log(f"⭐ Candidatos finales: {len(results_sorted)}")
     log("="*60)
 
-    return result
-
-# -------- PIPELINE PRINCIPAL (IDÉNTICO AL ORIGINAL) --------
-def run_analysis():
-    """Ejecuta el análisis completo del screener"""
-    
-    # Intentar obtener del caché primero
-    cached_results = get_cached_results()
-    if cached_results is not None:
-        if isinstance(cached_results, dict):
-            cached_results["from_cache"] = True
-        return cached_results
-    
-    log("="*60)
-    log("⏳ Iniciando análisis completo...")
-    log("="*60)
-    start_time = time.time()
-    
-    # 1. Universo
-    tickers = fetch_universe(limit=UNIVERSE_LIMIT)
-    log(f"📋 Tickers a evaluar: {len(tickers)}")
-
-    # 2. Históricos
-    hist_map = download_history_batch(tickers, period=None, batch_size=BATCH_SIZE, sleep=2.0, retries=2)
-
-    # 3. Prefiltro técnico estricto
-    log("🔍 Aplicando prefiltro técnico estricto...")
-    tech_ok = []
-    for tk, hist in hist_map.items():
-        price = float(hist["Close"].iloc[-1])
-        if not (PRICE_MIN <= price <= PRICE_MAX): 
-            continue
-        if hist.shape[0] < MA_LONG + 5: 
-            continue
-        
-        tech, _ = compute_technicals(hist)
-        if tech and tech["trend_up"] and (tech["rsi_ok"] and tech["macd_up"]):
-            tech_ok.append((tk, price, tech))
-
-    # 4. Prefiltro suave si quedan pocos
-    TARGET_MIN = 120
-    if len(tech_ok) < TARGET_MIN:
-        log(f"⚠ Solo {len(tech_ok)} con filtro estricto, aplicando filtro suave...")
-        tech_ok = []
-        for tk, hist in hist_map.items():
-            price = float(hist["Close"].iloc[-1])
-            if not (PRICE_MIN <= price <= PRICE_MAX) or hist.shape[0] < MA_LONG + 5: 
-                continue
-            
-            tech, _ = compute_technicals(hist)
-            if tech and (hist["Close"].iloc[-1] > hist["Close"].rolling(MA_LONG).mean().iloc[-1]) and \
-               (tech["rsi_ok"] or tech["macd_up"]):
-                tech_ok.append((tk, price, tech))
-
-    tech_ok = tech_ok[:MAX_FUND_REQS]
-    log(f"✓ Candidatos post-filtro técnico: {len(tech_ok)}")
-
-    # 5. Fundamentales + DCF + Scoring (con filtro de market cap)
-    log("💰 Analizando fundamentales, DCF y scores...")
-    MIN_MARKET_CAP = 5_000_000_000  # $5B mínimo (Oracle V7 style)
-
-    rows = []
-    for idx, (tk, price, tech) in enumerate(tqdm(tech_ok, desc="Fundamentales")):
-        fund = get_fundamentals_and_quality(tk)
-
-        # Filtro de market cap (Oracle V7 style)
-        mktcap = fund.get("market_cap")
-        if mktcap is not None and mktcap < MIN_MARKET_CAP:
-            continue  # Skip empresas pequeñas
-
-        six, fund_d, tech_d, score, bonus = evaluate_conditions(fund, tech)
-        bscore = buffett_score(fund, price, tech)
-
-        # Calcular MOS y MOS_ROIC
-        intrinsic = fund.get("intrinsic")
-        intrinsic_roic = fund.get("intrinsic_roic")
-
-        mos = None
-        mos_roic = None
-
-        if intrinsic not in (None, np.nan):
-            try:
-                mos = (intrinsic - price)/intrinsic
-            except Exception:
-                mos = None
-
-        if intrinsic_roic not in (None, np.nan):
-            try:
-                mos_roic = (intrinsic_roic - price)/intrinsic_roic
-            except Exception:
-                mos_roic = None
-
-        # Determinar categoría basada en MOS (Oracle V7 style)
-        category = "Hold"
-        avg_mos = None
-
-        if mos is not None and mos_roic is not None:
-            avg_mos = (mos + mos_roic) / 2
-        elif mos is not None:
-            avg_mos = mos
-        elif mos_roic is not None:
-            avg_mos = mos_roic
-
-        if avg_mos is not None:
-            if avg_mos >= 0.20:
-                category = "Strong Buy"
-            elif avg_mos >= 0.10:
-                category = "Buy"
-            elif avg_mos >= 0:
-                category = "Fair Value"
-            elif avg_mos >= -0.20:
-                category = "Watch"  # Hasta 20% sobrevalorado
-            else:
-                category = "Overvalued"
-
-        rows.append({
-            "ticker": tk,
-            "price": round(price, 2),
-            "score6": score,
-            "buffett_score": bscore,
-            "piotroski": fund.get("piotroski"),
-            "category": category,
-            "pe": fund.get("pe"),
-            "pb": fund.get("pb"),
-            "roe": fund.get("roe"),
-            "roic": fund.get("roic"),
-            "roic_growth": fund.get("roic_growth"),
-            "gross_margin": fund.get("gross_margin"),
-            "op_margin": fund.get("op_margin"),
-            "net_margin": fund.get("net_margin"),
-            "rev_cagr": fund.get("rev_cagr"),
-            "ni_cagr": fund.get("ni_cagr"),
-            "debt_ebitda": fund.get("debt_ebitda"),
-            "fcf_positive": fund.get("fcf_positive"),
-            "market_cap": mktcap,
-            "intrinsic": intrinsic,
-            "intrinsic_roic": intrinsic_roic,
-            "mos": mos,
-            "mos_roic": mos_roic,
-            "trend_up": tech["trend_up"],
-            "rsi_ok": tech["rsi_ok"],
-            "macd_up": tech["macd_up"],
-            "obv_up": tech.get("obv_up", False),
-            "atr_pct": tech.get("atr_pct", np.nan),
-            "volume_up": tech["volume_up"]
-        })
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        error_result = {
-            "error": "Sin resultados (posible rate-limit o filtros muy estrictos)",
-            "total_analyzed": 0,
-            "candidates_count": 0,
-            "from_cache": False,
-            "generated_at": datetime.now().isoformat()
-        }
-        log("❌ Sin resultados finales")
-        return error_result
-    
-    # 6. Ordenar (Buffett → score6 → ROIC)
-    log("🏆 Ordenando resultados...")
-    df = df.sort_values(["buffett_score", "score6", "roic"], ascending=[False, False, False]).reset_index(drop=True)
-
-    # 7. Filtrar candidatos
-    candidates = df[(df["buffett_score"] >= 7) | (df["score6"] >= SCORE_MIN)].copy()
-    if candidates.empty:
-        log("⚠ Relajando filtros (Buffett≥6 o score≥4)...")
-        candidates = df[(df["buffett_score"] >= 6) | (df["score6"] >= 4)].copy()
-
-    # 8. Diagnóstico de NaN (como el original)
-    missing_cols = ["intrinsic","rev_cagr","ni_cagr","roic","debt_ebitda","pe","pb"]
-    diag = {c: df[c].isna().mean() for c in missing_cols if c in df.columns}
-    log("📊 NaN en campos clave: " + str({k: f"{v*100:.1f}%" for k,v in diag.items()}))
-
-    # 9. Resultado final
-    execution_time = round(time.time() - start_time, 2)
-    
-    top_10_data = candidates.head(10).replace({np.nan: None}).to_dict('records')
-    
-    result = {
-        "candidates_count": len(candidates),
-        "total_analyzed": len(df),
-        "top_10": top_10_data,
-        "nan_diagnostics": {k: f"{v*100:.1f}%" for k,v in diag.items()},
-        "generated_at": datetime.now().isoformat(),
-        "cache_enabled": GCS_AVAILABLE,
-        "from_cache": False,
-        "execution_time_seconds": execution_time
-    }
-    
-    log("="*60)
-    log(f"✅ Análisis completado en {execution_time}s")
-    log(f"📊 Total analizados: {len(df)}")
-    log(f"⭐ Candidatos finales: {len(candidates)}")
-    log("="*60)
-    
     # Guardar en caché
     save_to_cache(result)
-    
+
+    # Agregar post-processing
+    result = post_process_oracle_results(result)
+
     return result
 
 # -------- POST-PROCESAMIENTO PARA ORACLE V7 --------
@@ -1388,12 +1208,18 @@ def home():
             "Top 10 mejores resultados"
         ],
         "endpoints": {
-            "/analyze": "Run full analysis with technical filters (Warren style)",
-            "/oracle": "Run pure fundamental analysis (Oracle V7 style - NO technical filters)",
+            "/analyze": "Run Oracle V7 pure fundamental analysis (NO technical filters)",
             "/cache-status": "Check cache status",
             "/clear-cache": "Clear cache manually",
             "/health": "Health check"
-        }
+        },
+        "oracle_v7_features": [
+            "✅ NO filtros técnicos (RSI, MACD, MA) - Pure fundamental",
+            "✅ Filtros: ROIC >= 8%, Piotroski >= 5, MOS >= -20%, Market cap >= $5B",
+            "✅ ROIC-based DCF con growth estimation",
+            "✅ Resultados idénticos al script Colab",
+            "✅ Incluye stocks con buenos fundamentales independiente del momentum"
+        ]
     })
 
 @app.route('/analyze')
@@ -1418,35 +1244,6 @@ def analyze():
         
     except Exception as e:
         log(f"❌ Error en análisis: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/oracle')
-def oracle():
-    """Endpoint Oracle V7 - Análisis puro fundamental sin filtros técnicos"""
-    try:
-        log("\n" + "="*60)
-        log("🏛️ Nueva petición Oracle V7 recibida")
-        log("="*60)
-
-        results = run_oracle_analysis()
-
-        # Post-procesar para agregar análisis adicional
-        results = post_process_oracle_results(results)
-
-        response = app.response_class(
-            response=json.dumps(results, default=str, allow_nan=False)
-                     .replace('NaN', 'null')
-                     .replace('Infinity', 'null')
-                     .replace('-Infinity', 'null'),
-            status=200,
-            mimetype='application/json'
-        )
-        return response
-
-    except Exception as e:
-        log(f"❌ Error en Oracle V7 analysis: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500

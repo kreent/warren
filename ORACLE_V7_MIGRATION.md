@@ -4,6 +4,8 @@
 
 El endpoint `/analyze` ahora usa **lógica Oracle V7 pura** (100% fundamental, sin filtros técnicos).
 
+**IMPORTANTE**: Se reemplazó completamente el pipeline de análisis para usar Oracle V7. Ya NO hay filtros técnicos (RSI, MACD, Moving Averages) ni descarga de históricos de precios.
+
 ## 🔄 ¿Qué Cambió?
 
 ### **ANTES** (Warren Screener con filtros técnicos)

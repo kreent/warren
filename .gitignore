@@ -24,8 +24,6 @@ wheels/
 venv/
 ENV/
 env/
-
-# IDE
 .vscode/
 .idea/
 *.swp
@@ -36,11 +34,3 @@ env/
 .DS_Store
 Thumbs.db
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Environment variables
-.env
-.env.local

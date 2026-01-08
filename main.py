@@ -1,7 +1,14 @@
 # =========================================
-# Screener Value + Momentum + Buffett (Cloud Run)
-# VERSIÓN COMPLETA - RESULTADOS IDÉNTICOS AL ORIGINAL
+# Warren Screener V4.0 - Oracle V7 Enhanced
+# Value + Momentum + Quality (Piotroski) + Buffett
 # CON CACHÉ EN CLOUD STORAGE DE 24 HORAS
+#
+# Nuevas características v4.0:
+# - Piotroski Score (0-9) para análisis de calidad
+# - ROIC-based growth estimation
+# - Dual DCF valuation (CAGR + ROIC methods)
+# - Market cap filter (≥$5B)
+# - MOS-based categories
 # =========================================
 
 import pandas as pd
@@ -433,13 +440,13 @@ def compute_cagr(latest, past, periods):
 
 def cagr_from_series(df, row_label, years_pref=5):
     """Calcula CAGR desde una serie temporal con fallback a 3 o 2 años"""
-    if not (isinstance(df, pd.DataFrame) and not df.empty): 
+    if not (isinstance(df, pd.DataFrame) and not df.empty):
         return None
     try:
         s = df.loc[row_label].dropna()
     except Exception:
         return None
-    
+
     # Intenta 5 años, luego 3, luego 2
     if len(s) >= years_pref:
         past, latest, periods = s.iloc[-years_pref], s.iloc[-1], years_pref-1
@@ -449,8 +456,160 @@ def cagr_from_series(df, row_label, years_pref=5):
         past, latest, periods = s.iloc[-2], s.iloc[-1], 1
     else:
         return None
-    
+
     return compute_cagr(latest, past, periods)
+
+def calculate_piotroski_score(income_df, balance_df, cashflow_df):
+    """
+    Calcula el Piotroski Score (0-9) basado en:
+    - Rentabilidad (4 pts): NI > 0, OCF > 0, ROA mejoró, OCF > NI
+    - Apalancamiento (3 pts): Deuda bajó, Current Ratio mejoró, No emisión acciones
+    - Eficiencia (2 pts): Margen bruto mejoró, Asset Turnover mejoró
+    """
+    score = 0
+
+    try:
+        # Preparar datos (ordenar cronológicamente)
+        if income_df is not None and not income_df.empty:
+            inc = income_df[sorted(income_df.columns, reverse=True)]
+        else:
+            return 5  # Score neutral si no hay datos
+
+        if balance_df is not None and not balance_df.empty:
+            bal = balance_df[sorted(balance_df.columns, reverse=True)]
+        else:
+            bal = None
+
+        if cashflow_df is not None and not cashflow_df.empty:
+            cf = cashflow_df[sorted(cashflow_df.columns, reverse=True)]
+        else:
+            cf = None
+
+        # Extraer métricas actuales y pasadas
+        ni_curr = safe_get(last_col(inc), ["Net Income", "NetIncome"])
+        ni_cols = inc.columns if inc is not None else []
+
+        # 1. Net Income > 0
+        if ni_curr is not None and ni_curr > 0:
+            score += 1
+
+        # 2. Operating Cash Flow > 0
+        if cf is not None:
+            ocf_curr = safe_get(last_col(cf), ["Total Cash From Operating Activities", "Operating Cash Flow"])
+            if ocf_curr is not None and ocf_curr > 0:
+                score += 1
+
+                # 4. OCF > Net Income (calidad de ganancias)
+                if ni_curr is not None and ocf_curr > ni_curr:
+                    score += 1
+
+        # 3. ROA mejoró (comparar con año anterior)
+        if bal is not None and len(ni_cols) >= 2:
+            try:
+                assets_curr = safe_get(last_col(bal), ["Total Assets", "TotalAssets"])
+
+                # Columna anterior
+                inc_prev = inc[inc.columns[1]]
+                ni_prev = safe_get(inc_prev, ["Net Income", "NetIncome"])
+
+                bal_prev = bal[bal.columns[1]] if len(bal.columns) >= 2 else None
+                assets_prev = safe_get(bal_prev, ["Total Assets", "TotalAssets"]) if bal_prev is not None else None
+
+                if all(v is not None and v != 0 for v in [ni_curr, ni_prev, assets_curr, assets_prev]):
+                    roa_curr = float(ni_curr) / float(assets_curr)
+                    roa_prev = float(ni_prev) / float(assets_prev)
+                    if roa_curr > roa_prev:
+                        score += 1
+            except:
+                pass
+
+        # 5. Deuda/Apalancamiento bajó
+        if bal is not None and len(bal.columns) >= 2:
+            try:
+                debt_curr = safe_get(last_col(bal), ["Total Debt", "TotalDebt", "Long Term Debt"])
+                bal_prev = bal[bal.columns[1]]
+                debt_prev = safe_get(bal_prev, ["Total Debt", "TotalDebt", "Long Term Debt"])
+
+                if debt_curr is not None and debt_prev is not None:
+                    if debt_curr <= debt_prev:
+                        score += 1
+            except:
+                pass
+
+        # 6. Current Ratio mejoró (liquidez)
+        if bal is not None and len(bal.columns) >= 2:
+            try:
+                curr_assets = safe_get(last_col(bal), ["Current Assets", "CurrentAssets"])
+                curr_liab = safe_get(last_col(bal), ["Current Liabilities", "CurrentLiabilities"])
+
+                bal_prev = bal[bal.columns[1]]
+                curr_assets_prev = safe_get(bal_prev, ["Current Assets", "CurrentAssets"])
+                curr_liab_prev = safe_get(bal_prev, ["Current Liabilities", "CurrentLiabilities"])
+
+                if all(v is not None and v != 0 for v in [curr_assets, curr_liab, curr_assets_prev, curr_liab_prev]):
+                    cr_curr = float(curr_assets) / float(curr_liab)
+                    cr_prev = float(curr_assets_prev) / float(curr_liab_prev)
+                    if cr_curr > cr_prev:
+                        score += 1
+            except:
+                pass
+
+        # 7. No emisión de nuevas acciones (shares outstanding no aumentó)
+        if bal is not None and len(bal.columns) >= 2:
+            try:
+                shares_curr = safe_get(last_col(bal), ["Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding"])
+                bal_prev = bal[bal.columns[1]]
+                shares_prev = safe_get(bal_prev, ["Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding"])
+
+                if shares_curr is not None and shares_prev is not None:
+                    if shares_curr <= shares_prev:
+                        score += 1
+            except:
+                pass
+
+        # 8. Margen bruto mejoró
+        if len(ni_cols) >= 2:
+            try:
+                gp_curr = safe_get(last_col(inc), ["Gross Profit", "GrossProfit"])
+                rev_curr = safe_get(last_col(inc), ["Total Revenue", "TotalRevenue"])
+
+                inc_prev = inc[inc.columns[1]]
+                gp_prev = safe_get(inc_prev, ["Gross Profit", "GrossProfit"])
+                rev_prev = safe_get(inc_prev, ["Total Revenue", "TotalRevenue"])
+
+                if all(v is not None and v != 0 for v in [gp_curr, rev_curr, gp_prev, rev_prev]):
+                    gm_curr = float(gp_curr) / float(rev_curr)
+                    gm_prev = float(gp_prev) / float(rev_prev)
+                    if gm_curr > gm_prev:
+                        score += 1
+            except:
+                pass
+
+        # 9. Asset Turnover mejoró (eficiencia)
+        if bal is not None and len(ni_cols) >= 2:
+            try:
+                rev_curr = safe_get(last_col(inc), ["Total Revenue", "TotalRevenue"])
+                assets_curr = safe_get(last_col(bal), ["Total Assets", "TotalAssets"])
+
+                inc_prev = inc[inc.columns[1]]
+                rev_prev = safe_get(inc_prev, ["Total Revenue", "TotalRevenue"])
+
+                bal_prev = bal[bal.columns[1]] if len(bal.columns) >= 2 else None
+                assets_prev = safe_get(bal_prev, ["Total Assets", "TotalAssets"]) if bal_prev is not None else None
+
+                if all(v is not None and v != 0 for v in [rev_curr, assets_curr, rev_prev, assets_prev]):
+                    at_curr = float(rev_curr) / float(assets_curr)
+                    at_prev = float(rev_prev) / float(assets_prev)
+                    if at_curr > at_prev:
+                        score += 1
+            except:
+                pass
+
+        return max(0, min(9, score))
+
+    except Exception as e:
+        # En caso de error, retornar score neutral
+        return 5
 
 # -------- Análisis fundamental COMPLETO (ORIGINAL) --------
 def get_fundamentals_and_quality(ticker):
@@ -584,32 +743,62 @@ def get_fundamentals_and_quality(ticker):
 
     # Shares fallback
     if shares in (None, 0) and mktcap and price:
-        try: 
+        try:
             shares = int(float(mktcap)/float(price))
-        except Exception: 
+        except Exception:
             pass
 
-    # DCF con proxy prudente
+    # Piotroski Score
+    piotroski = calculate_piotroski_score(income_y, bal_y, cash_y)
+
+    # ROIC-based growth estimation (Oracle V7 style)
+    # Empresas con alto ROIC tienden a tener mayor capacidad de reinversión
+    roic_growth = None
+    if roic is not None and roic > 0:
+        # Growth proxy: min(roic * 0.5, 0.14), max 3%
+        roic_growth = min(roic * 0.5, 0.14)
+        roic_growth = max(roic_growth, 0.03)
+
+    # DCF con proxy prudente y estimación dual de crecimiento
     intrinsic = None
+    intrinsic_roic = None  # Valoración alternativa con growth basado en ROIC
+
     try:
         fcf_base = fcf if fcf not in (None, np.nan) else \
                    (FCF_SALES_PROXY * float(revenue) if revenue not in (None,0) else None)
-        
+
         if fcf_base is not None and shares not in (None, 0):
+            # Método 1: CAGR histórico (original)
             g_base = np.nanmean([x for x in [rev_cagr, ni_cagr] if x is not None]) if any([rev_cagr, ni_cagr]) else 0.05
             g_base = max(-0.05, min(float(g_base), MAX_GROWTH_CAP))
-            
+
             fcfs, f = [], fcf_base
             for y in range(1, 11):
                 growth = g_base * (0.9 ** (y-1))
                 f = f * (1 + growth)
                 fcfs.append(f / ((1+DISCOUNT_RATE)**y))
-            
+
             terminal = fcfs[-1] * (1+TERMINAL_G) / (DISCOUNT_RATE - TERMINAL_G)
             ev = np.nansum(fcfs) + terminal/((1+DISCOUNT_RATE)**1)
             equity_val = ev - (net_debt if net_debt is not None else 0.0)
             intrinsic = float(equity_val) / float(shares)
-    except Exception: 
+
+            # Método 2: ROIC-based growth (Oracle V7 style) - más conservador
+            if roic_growth is not None:
+                fcfs_roic, f_roic = [], fcf_base
+                for y in range(1, 6):  # 5 años como Oracle V7
+                    f_roic = f_roic * (1 + roic_growth)
+                    fcfs_roic.append(f_roic / ((1+DISCOUNT_RATE)**y))
+
+                # Terminal con 3% growth (Oracle V7 style)
+                terminal_fcf = fcfs_roic[-1] * 1.03
+                term_val = terminal_fcf / (DISCOUNT_RATE - 0.03)
+                term_val_pv = term_val / ((1+DISCOUNT_RATE)**5)
+
+                ev_roic = np.nansum(fcfs_roic) + term_val_pv
+                equity_val_roic = ev_roic + (cash if cash is not None else 0) - (total_debt if total_debt is not None else 0)
+                intrinsic_roic = float(equity_val_roic) / float(shares)
+    except Exception:
         pass
 
     return {
@@ -617,7 +806,7 @@ def get_fundamentals_and_quality(ticker):
         "pb": (float(pb) if pb not in (None, "None", np.nan) else None),
         "roe": (float(roe) if roe is not None else None),
         "debt_ebitda": (float(debt_ebitda) if debt_ebitda not in (None, "None", np.nan) else None),
-        "fcf": fcf, 
+        "fcf": fcf,
         "fcf_positive": (fcf is not None and fcf > 0),
         "gross_margin": (float(gross_margin) if gross_margin is not None else None),
         "op_margin": (float(op_margin) if op_margin is not None else None),
@@ -625,8 +814,12 @@ def get_fundamentals_and_quality(ticker):
         "rev_cagr": (float(rev_cagr) if rev_cagr is not None else None),
         "ni_cagr": (float(ni_cagr) if ni_cagr is not None else None),
         "roic": (float(roic) if roic is not None else None),
+        "roic_growth": (float(roic_growth) if roic_growth is not None else None),
+        "piotroski": int(piotroski),
+        "market_cap": (float(mktcap) if mktcap not in (None, np.nan) else None),
         "shares_out": (int(shares) if shares not in (None, np.nan) else None),
-        "intrinsic": (float(intrinsic) if intrinsic not in (None, np.nan) else None)
+        "intrinsic": (float(intrinsic) if intrinsic not in (None, np.nan) else None),
+        "intrinsic_roic": (float(intrinsic_roic) if intrinsic_roic not in (None, np.nan) else None)
     }
 
 # -------- Scoring (ORIGINAL COMPLETO) --------
@@ -653,50 +846,68 @@ def evaluate_conditions(fund, tech):
 
 def buffett_score(fund, price, tech):
     """
-    Buffett Score 0-10:
-    - Calidad (4): ROIC, márgenes, crecimiento
+    Buffett Score 0-10 (mejorado con Piotroski):
+    - Calidad (5): ROIC, márgenes, crecimiento, Piotroski
     - Fortaleza (2): deuda, FCF
-    - Valoración (3): DCF MOS, PE, PB
+    - Valoración (2): DCF MOS, PE/PB
     - Técnica (1): tendencia + señales
     """
     pts = 0.0
-    
-    # Calidad (4 pts)
-    if fund.get("roic") is not None and fund["roic"] >= 0.12: 
+
+    # Calidad (5 pts) - Ahora incluye Piotroski
+    if fund.get("roic") is not None and fund["roic"] >= 0.12:
         pts += 1.5
-    if fund.get("op_margin") is not None and fund["op_margin"] >= 0.15: 
+    if fund.get("op_margin") is not None and fund["op_margin"] >= 0.15:
         pts += 1.0
-    if fund.get("gross_margin") is not None and fund["gross_margin"] >= 0.40: 
+    if fund.get("gross_margin") is not None and fund["gross_margin"] >= 0.40:
         pts += 0.5
-    
+
     growth = np.nanmean([x for x in [fund.get("rev_cagr"), fund.get("ni_cagr")] if x is not None])
-    if pd.notna(growth) and growth >= 0.05: 
-        pts += 1.0
-    
+    if pd.notna(growth) and growth >= 0.05:
+        pts += 0.5
+
+    # Piotroski Score (0-9) → convertir a 0-1.5 pts
+    piotroski = fund.get("piotroski", 5)
+    if piotroski >= 7:
+        pts += 1.5
+    elif piotroski >= 5:
+        pts += 0.75
+
     # Fortaleza (2 pts)
-    if fund.get("debt_ebitda") is not None and fund["debt_ebitda"] <= 2.5: 
+    if fund.get("debt_ebitda") is not None and fund["debt_ebitda"] <= 2.5:
         pts += 1.0
-    if fund.get("fcf") is not None and fund["fcf"] > 0: 
+    if fund.get("fcf") is not None and fund["fcf"] > 0:
         pts += 1.0
-    
-    # Valoración (3 pts)
+
+    # Valoración (2 pts) - Ahora usa ambos intrinsic values si disponible
     intrinsic = fund.get("intrinsic")
-    if intrinsic not in (None, np.nan) and price is not None:
-        mos_ok = price <= intrinsic * (1 - MOS_THRESHOLD)
-        if mos_ok: 
-            pts += 2.0
-        elif price <= intrinsic * 0.9: 
-            pts += 1.0
-    
-    if fund.get("pe") is not None and fund["pe"] <= 20: 
-        pts += 0.5
-    if fund.get("pb") is not None and fund["pb"] <= 3: 
-        pts += 0.5
-    
+    intrinsic_roic = fund.get("intrinsic_roic")
+
+    # Usar el promedio si ambos están disponibles, o el que esté disponible
+    intrinsic_avg = None
+    if intrinsic is not None and intrinsic_roic is not None:
+        intrinsic_avg = (intrinsic + intrinsic_roic) / 2
+    elif intrinsic is not None:
+        intrinsic_avg = intrinsic
+    elif intrinsic_roic is not None:
+        intrinsic_avg = intrinsic_roic
+
+    if intrinsic_avg not in (None, np.nan) and price is not None:
+        mos_ok = price <= intrinsic_avg * (1 - MOS_THRESHOLD)
+        if mos_ok:
+            pts += 1.5
+        elif price <= intrinsic_avg * 0.9:
+            pts += 0.75
+
+    if fund.get("pe") is not None and fund["pe"] <= 20:
+        pts += 0.25
+    if fund.get("pb") is not None and fund["pb"] <= 3:
+        pts += 0.25
+
     # Técnica (1 pt)
-    if tech["trend_up"] and (tech["rsi_ok"] or tech["macd_up"]) and tech.get("obv_up", False): 
+    if tech["trend_up"] and (tech["rsi_ok"] or tech["macd_up"]) and tech.get("obv_up", False):
         pts += 1.0
-    
+
     return round(min(10.0, pts), 2)
 
 # -------- PIPELINE PRINCIPAL (IDÉNTICO AL ORIGINAL) --------
@@ -754,31 +965,76 @@ def run_analysis():
     tech_ok = tech_ok[:MAX_FUND_REQS]
     log(f"✓ Candidatos post-filtro técnico: {len(tech_ok)}")
 
-    # 5. Fundamentales + DCF + Scoring
+    # 5. Fundamentales + DCF + Scoring (con filtro de market cap)
     log("💰 Analizando fundamentales, DCF y scores...")
+    MIN_MARKET_CAP = 5_000_000_000  # $5B mínimo (Oracle V7 style)
+
     rows = []
     for idx, (tk, price, tech) in enumerate(tqdm(tech_ok, desc="Fundamentales")):
         fund = get_fundamentals_and_quality(tk)
+
+        # Filtro de market cap (Oracle V7 style)
+        mktcap = fund.get("market_cap")
+        if mktcap is not None and mktcap < MIN_MARKET_CAP:
+            continue  # Skip empresas pequeñas
+
         six, fund_d, tech_d, score, bonus = evaluate_conditions(fund, tech)
         bscore = buffett_score(fund, price, tech)
-        
+
+        # Calcular MOS y MOS_ROIC
         intrinsic = fund.get("intrinsic")
+        intrinsic_roic = fund.get("intrinsic_roic")
+
         mos = None
+        mos_roic = None
+
         if intrinsic not in (None, np.nan):
-            try: 
+            try:
                 mos = (intrinsic - price)/intrinsic
-            except Exception: 
+            except Exception:
                 mos = None
-        
+
+        if intrinsic_roic not in (None, np.nan):
+            try:
+                mos_roic = (intrinsic_roic - price)/intrinsic_roic
+            except Exception:
+                mos_roic = None
+
+        # Determinar categoría basada en MOS (Oracle V7 style)
+        category = "Hold"
+        avg_mos = None
+
+        if mos is not None and mos_roic is not None:
+            avg_mos = (mos + mos_roic) / 2
+        elif mos is not None:
+            avg_mos = mos
+        elif mos_roic is not None:
+            avg_mos = mos_roic
+
+        if avg_mos is not None:
+            if avg_mos >= 0.20:
+                category = "Strong Buy"
+            elif avg_mos >= 0.10:
+                category = "Buy"
+            elif avg_mos >= 0:
+                category = "Fair Value"
+            elif avg_mos >= -0.20:
+                category = "Watch"  # Hasta 20% sobrevalorado
+            else:
+                category = "Overvalued"
+
         rows.append({
             "ticker": tk,
             "price": round(price, 2),
             "score6": score,
             "buffett_score": bscore,
+            "piotroski": fund.get("piotroski"),
+            "category": category,
             "pe": fund.get("pe"),
             "pb": fund.get("pb"),
             "roe": fund.get("roe"),
             "roic": fund.get("roic"),
+            "roic_growth": fund.get("roic_growth"),
             "gross_margin": fund.get("gross_margin"),
             "op_margin": fund.get("op_margin"),
             "net_margin": fund.get("net_margin"),
@@ -786,8 +1042,11 @@ def run_analysis():
             "ni_cagr": fund.get("ni_cagr"),
             "debt_ebitda": fund.get("debt_ebitda"),
             "fcf_positive": fund.get("fcf_positive"),
+            "market_cap": mktcap,
             "intrinsic": intrinsic,
+            "intrinsic_roic": intrinsic_roic,
             "mos": mos,
+            "mos_roic": mos_roic,
             "trend_up": tech["trend_up"],
             "rsi_ok": tech["rsi_ok"],
             "macd_up": tech["macd_up"],
@@ -858,17 +1117,25 @@ app = Flask(__name__)
 def home():
     cache_status = "enabled" if GCS_AVAILABLE else "disabled"
     return jsonify({
-        "status": "Warren Screener API v3.0 (Lógica Original Completa)",
-        "version": "3.0",
+        "status": "Warren Screener API v4.0 (Oracle V7 Enhanced)",
+        "version": "4.0",
         "cache": cache_status,
         "bucket": GCS_BUCKET_NAME if GCS_AVAILABLE else "not configured",
         "cache_ttl_hours": CACHE_TTL_HOURS,
-        "improvements": [
+        "new_features_v4": [
+            "✅ Piotroski Score (0-9) para calidad financiera",
+            "✅ ROIC-based growth estimation (Oracle V7 style)",
+            "✅ Dual DCF valuation (CAGR + ROIC methods)",
+            "✅ Market cap filter (≥$5B)",
+            "✅ MOS-based categories (Strong Buy/Buy/Fair/Watch/Overvalued)",
+            "✅ Enhanced Buffett Score con Piotroski integration"
+        ],
+        "core_features": [
             "Cálculo TTM completo desde quarterly statements",
             "CAGR con fallbacks (5→3→2 años)",
             "safe_get() robusto para múltiples nombres de campos",
             "Threads=False y auto_adjust=False en descarga",
-            "Lógica DCF idéntica al script original",
+            "Technical analysis (RSI, MACD, MA, OBV, ATR)",
             "Top 10 mejores resultados"
         ],
         "endpoints": {
